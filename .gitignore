@@ -6,3 +6,18 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# 本地检查环境和缓存
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# 运行产物含页面、代理配置或账号状态，仅在临时环境使用
+output/
+screenshots/
+*.log
+*-time-value.txt
+sing-box
+sing-box_config.json
+socks5_proxy.txt
+proxy_result.json

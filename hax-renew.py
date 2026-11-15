@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, platform, requests, re, json, subprocess, socket, threading, hashlib
+import os, sys, time, platform, requests, re, json, subprocess, socket, threading
 os.environ["PATH"] = os.path.expanduser("~/bin") + os.pathsep + os.environ.get("PATH", "")
 import tempfile, html as html_mod, random
 from datetime import datetime, timezone, timedelta, date
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from DrissionPage import ChromiumPage, ChromiumOptions
 from gen_singbox_config import setup_proxy
+from scripts.public_report import publish_progress, publish_results, renewal_verified, screenshot_allowed
 
 # ── 可选依赖：reCAPTCHA 语音识别 ──────────────────────────────────────
 try:
@@ -349,7 +350,7 @@ class TGVerificationCodeExtractor:
                         except Exception:
                             continue
                         if "au_confirm" in data_str:
-                            print(f"  [INFO] 已找到tg官方联系人对话中的 Confirm 按钮，callback_data: {data_str}")
+                            print("  [INFO] 已找到 TG 官方联系人对话中的 Confirm 按钮")
                             try:
                                 await client(functions.messages.GetBotCallbackAnswerRequest(
                                     peer=msg.peer_id,
@@ -1261,6 +1262,8 @@ def shot(idx: int, name: str) -> str:
     return str(OUTPUT_DIR / f"acc{idx}-{cn_now().strftime('%H%M%S')}-{name}.png")
 
 def safe_screenshot(browser, path: str):
+    if not screenshot_allowed(browser, path, HAX_BASE_URL):
+        return
     try:
         browser.save_screenshot(path)
         print(f"  [INFO] 截图 → {Path(path).name}")
@@ -1412,6 +1415,7 @@ def _tg_header(masked_phone: str, tg_chat: str = None, ip_info: str = "",
 def notify(result: dict, username: str, tg_token: str = None, tg_chat: str = None,
            ip_info: str = "", server_online: str = ""):
     """发送单个服务器的续期结果通知，先发 VPS 截图再发文字报告"""
+    publish_progress("notifying")
     token = tg_token
     chat = tg_chat
     if not token or not chat: return
@@ -1431,7 +1435,8 @@ def notify(result: dict, username: str, tg_token: str = None, tg_chat: str = Non
         msg = result.get("message", "")
 
         # 无论成功还是失败，最后发送最终 info 页面截图，并附带到期日对比。
-        vps_shot = result.get("screenshot") or result.get("vps_info_screenshot", "")
+        vps_shot = next((path for path in (result.get("screenshot"), result.get("vps_info_screenshot"))
+                         if path and Path(path).name.endswith("-vps_info.png") and Path(path).is_file()), None)
         expiry_info = result.get("expiry_info", "")
         if vps_shot and Path(vps_shot).exists():
             caption = f"🖥️ 最终 VPS 信息截图 - {hostname}"
@@ -1454,10 +1459,11 @@ def notify(result: dict, username: str, tg_token: str = None, tg_chat: str = Non
                 if ipv6:
                     text += f"🌐 IPv6: {ipv6}\n"
             else:
+                renewal_status = "✅ 续期成功" if renewal_verified(result) else "⚠️ 续期结果待核实"
                 text = (
                     f"<b>🎮 {HAX_TITLE} 续期报告</b>\n"
                     f"{header}"
-                    f"✅ 续期成功\n"
+                    f"{renewal_status}\n"
                     f"🖥️ 服务器: {hostname}\n"
                     f"📍 位置: {location}\n"
                     f"📊 状态: {status}\n"
@@ -2606,7 +2612,7 @@ def _renew_start_tg_listener(proxy: str = None, since: datetime = None):
                 # 再监听新消息
                 code_holder[0] = tg_wait_for_code_sync(HAX_BOT, timeout=150, proxy=proxy)
                 if code_holder[0]:
-                    print(f"  [INFO] TG 后台捕获验证码: {code_holder[0]}")
+                    print("  [INFO] TG 后台已收到验证码")
             except Exception as e:
                 print(f"  [WARN] TG 后台监听异常: {e}")
         tg_thread = threading.Thread(target=_tg_listen, daemon=True)
@@ -2801,6 +2807,9 @@ def _renew_refresh_code_page_after_captcha(browser, idx: int, sid_f: str,
 
 def _renew_capture_final_info(browser, result: dict, old_valid_until: str) -> None:
     """无论续期成败，最后回到 VPS info 页面并以该页截图/到期日为准。"""
+    result["info_valid_until"] = ""
+    result["screenshot"] = None
+    result["vps_info_screenshot"] = ""
     try:
         servers, error, screenshot = hax_get_vps_info(browser, result.get("_idx", 0))
         if screenshot:
@@ -2811,6 +2820,7 @@ def _renew_capture_final_info(browser, result: dict, old_valid_until: str) -> No
         if current:
             new_valid = current.get("valid_until", "")
             if new_valid:
+                result["info_valid_until"] = new_valid
                 result["new_valid_until"] = new_valid
                 result["expiry_info"] = f"{old_valid_until} → {new_valid}" if old_valid_until else f"新到期日: {new_valid}"
                 print(f"  [INFO] info 页面到期日对比: {old_valid_until} → {new_valid}")
@@ -3085,6 +3095,10 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
     max_attempts = MAX_RENEW_RETRIES_PER_URL + 1
     forced_arithmetic_retry_used = False
     for renew_attempt in range(1, max_attempts + 1):
+        # 重试时清除上一轮的截图和日期，避免把旧页面当作本次最终结果。
+        result["screenshot"] = None
+        result["vps_info_screenshot"] = ""
+        result["info_valid_until"] = ""
         if renew_attempt > 1:
             print(f"  [INFO] 续期重试 {renew_attempt}/{MAX_RENEW_RETRIES_PER_URL}...")
 
@@ -3206,6 +3220,7 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
               "success": False, "message": "", "servers": []}
 
     # 1. 登录（手机号 + TG 验证码）
+    publish_progress("login")
     login_ok = hax_login_flow(browser, phone, idx, proxy=proxy)
     if not login_ok:
         result["message"] = "登录失败"
@@ -3214,15 +3229,27 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
         return result
 
     # 2. 查询 VPS 信息
+    publish_progress("reading_vps")
     servers, error, dash_shot = hax_get_vps_info(browser, idx)
+    dash_shot = dash_shot or ""
+    if not servers and not error:
+        result["public_state"] = "no_vps"
+        result["success"] = True
+        result["message"] = "无可用服务器，无需续期"
+        notify_no_server(phone, dash_shot, tg_token=tg_token, tg_chat=tg_chat,
+                         ip_info=ip_info, phone_mask=result.get("phoneMask", ""))
+        logout(browser)
+        return result
     if error and not servers:
         if error == "PROVISIONING":
+            result["public_state"] = "no_vps"
             # VPS 排队/开机中（PENDING/PROCESS），不是失败，无需续期
             result["message"] = "排队/开机中，无需续期"
             result["success"] = True
             notify_provisioning(phone, dash_shot, tg_token=tg_token, tg_chat=tg_chat,
                                 ip_info=ip_info, phone_mask=result.get("phoneMask", ""))
         elif error == "FAILED":
+            result["public_state"] = "no_vps"
             # VPS 创建失败（FAILED），无可用服务器，非登录问题
             result["message"] = "无可用服务器，无需续期"
             result["success"] = True
@@ -3243,6 +3270,7 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
 
     # 3. 对每个服务器续期
     for srv in servers:
+        publish_progress("renewing")
         r = renew(browser, srv, idx, phone,
                   tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info,
                   proxy=proxy, phone_mask=result.get("phoneMask", ""))
@@ -3516,6 +3544,7 @@ def _send_tg_report(results, masked_phone, tg_token, tg_chat, ip_info):
 
 
 def main():
+    publish_progress("preparing")
     # ── 正常续期流程 ─────────────────────────────────────────────────
     # 校验必填环境变量
     if not BATCH:
@@ -3679,27 +3708,6 @@ def main():
             print(f"  {s_status} {s.get('server_name', 'Unknown')}: {s.get('message', '')}")
     print(f"{'='*40}")
 
-    # 输出各账户的时间文件值：有效到期日(YYYY-MM-DD) 或 NOVPS（无机器/失败状态）
-    try:
-        value_lines = []
-        for r in results:
-            phone = r.get("username", "")
-            key = hashlib.md5(phone.strip().encode()).hexdigest()[:8]
-            best = None
-            for s in r.get("servers", []):
-                # r["servers"] 是 renew() 返回值：优先用续期后的 new_valid_until，
-                # 回退续期前的 old_valid_until（跳过续期时两者相同）
-                vu = s.get("new_valid_until") or s.get("old_valid_until") or ""
-                if _parse_iso_date(vu):
-                    if best is None or vu < best:
-                        best = vu
-            value_lines.append(f"{key},{best if best else 'NOVPS'}")
-        with open("hax-time-value.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(value_lines) + "\n")
-        print("[INFO] 时间文件值已写入 hax-time-value.txt")
-    except Exception as e:
-        print(f"[WARN] 时间文件值写入失败: {e}")
-
     # 发送 TG 汇总报告：仅当 BATCH 含多个账号时才发送；
     # 单账号由单台续期报告覆盖，这里只补打验证码求解统计到控制台。
     if len(accounts) > 1:
@@ -3711,7 +3719,8 @@ def main():
     else:
         CaptchaSolver.print_stats()
 
-    # sys.exit(0 if ok_srv > 0 else 1)
+    # 输出已知的到期日或明确的无 VPS 状态，失败不覆盖旧记录。
+    return publish_results(results, "hax")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
