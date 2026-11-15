@@ -55,6 +55,7 @@ class ScreenshotTests(unittest.TestCase):
                     f"{platform.upper()}_TITLE": domain,
                     "mask": lambda value: "***",
                     "_tg_header": lambda *args, **kwargs: "",
+                    "send_tg_message": lambda token, chat, text: texts.append(text),
                     "send_tg_photo": lambda token, chat, path, caption: photos.append(
                         path
                     ),

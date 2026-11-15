@@ -16,6 +16,7 @@ from scripts.accounts import (
     selected_account,
 )
 from scripts.public_report import iso_date
+from scripts.job_summary import render_summary, write_summary
 from scripts.state import CACHE_FILE, prepare_cached_state, read_cached_state
 
 
@@ -96,11 +97,15 @@ def notify_skipped(platform: str) -> None:
             if not isinstance(result, dict) or result.get("ok") is not True:
                 raise ValueError("notification_failed")
         print(f"account={index} stage=notification result=sent")
+        if os.environ.get("GITHUB_OUTPUT"):
+            _outputs({"notification_status": "sent"})
     except Exception:
         # 通知失败不改变无需续期的业务结果。
         print(
             f"account={index} stage=notification result=failed category=notification_failed"
         )
+        if os.environ.get("GITHUB_OUTPUT"):
+            _outputs({"notification_status": "failed"})
 
 
 def prepare_state(platform: str) -> None:
@@ -147,11 +152,32 @@ def main() -> int:
                 notify_skipped(sys.argv[2])
             case "prepare-state":
                 prepare_state(sys.argv[2])
+            case "summary":
+                raw = os.environ.get("BATCH_ACCOUNT_INDEX", "1")
+                index = (
+                    int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 3 else 0
+                )
+                write_summary(
+                    render_summary(
+                        sys.argv[2],
+                        index if 1 <= index <= 256 else 0,
+                        os.environ,
+                        Path.cwd(),
+                    )
+                )
             case _:
                 raise ValueError("invalid_arguments")
         return 0
     except Exception:
         print("result=failed category=workflow_step_failed")
+        if (
+            len(sys.argv) == 3
+            and sys.argv[1] == "matrix"
+            and sys.argv[2] in {"hax", "woiden"}
+        ):
+            write_summary(
+                f"### {'Hax' if sys.argv[2] == 'hax' else 'Woiden'} · 账号配置\n\n**❌ 账号配置检查失败**\n\n请检查 renewal 环境中的账号配置及分支规则。\n"
+            )
         return 1
 
 

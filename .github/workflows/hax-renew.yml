@@ -47,6 +47,7 @@ jobs:
     env:
       BATCH_ACCOUNT_INDEX: ${{ matrix.index }}
       DEBUG_FLAG: '0'
+      PUBLIC_SUMMARY_DEFERRED: '1'
       SKIP_DAYS: '5'
       HAX_MIN_VALID_DAYS: '5'
       # 续期重试次数（外层）
@@ -57,6 +58,7 @@ jobs:
       MAX_LOGIN_RETRIES: '1'
     steps:
       - name: 检出仓库
+        id: checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -88,6 +90,7 @@ jobs:
         run: python3 -m scripts.workflow check hax
 
       - name: 通知跳过的账号
+        id: notify-skipped
         if: steps.decide.outputs.should_run == 'false'
         env:
           BATCH: ${{ secrets.BATCH }}
@@ -95,6 +98,7 @@ jobs:
         run: python3 -m scripts.workflow notify-skipped hax
 
       - name: 设置 Python
+        id: setup-python
         if: steps.decide.outputs.should_run == 'true'
         uses: actions/setup-python@v7
         with:
@@ -110,6 +114,7 @@ jobs:
           key: apt-chromium-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: 安装依赖
+        id: install-dependencies
         if: steps.decide.outputs.should_run == 'true'
         run: |
           mkdir -p "$HOME/.cache/hax-apt/partial"
@@ -121,10 +126,12 @@ jobs:
           python3 -c 'import speech_recognition, pydub, audioop; print("语音依赖导入成功")'
 
       - name: 启用 WARP
+        id: warp
         if: steps.decide.outputs.should_run == 'true'
         run: bash scripts/setup_warp.sh
 
       - name: 安装代理
+        id: proxy
         if: steps.decide.outputs.should_run == 'true'
         env:
           PROXY_CONTENT: ${{ secrets.PROXY_URL }}
@@ -170,6 +177,47 @@ jobs:
         with:
           path: output/renewal-state.json
           key: ${{ steps.cache-key.outputs.cache_key }}
+
+      # 精确查询本轮新 key，不下载快照，也不把 save 步骤绿色状态当作上传成功。
+      - name: 核实本轮缓存
+        id: verify-cache
+        if: always() && !cancelled() && steps.state.outputs.changed == 'true' && (steps.save-cache.outcome == 'success' || steps.save-cache.outcome == 'failure')
+        uses: actions/cache/restore@v6
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: output/renewal-state.json
+          key: ${{ steps.cache-key.outputs.cache_key }}
+          lookup-only: true
+
+      - name: 生成运行摘要
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          CACHE_KEY_OUTCOME: ${{ steps.cache-key.outcome }}
+          CHECK_OUTCOME: ${{ steps.decide.outcome }}
+          SHOULD_RUN: ${{ steps.decide.outputs.should_run }}
+          DAYS_LEFT: ${{ steps.decide.outputs.days_left }}
+          CACHE_STATUS: ${{ steps.decide.outputs.cache_status }}
+          NOTIFY_STATUS: ${{ steps.notify-skipped.outputs.notification_status }}
+          NOTIFY_OUTCOME: ${{ steps.notify-skipped.outcome }}
+          PYTHON_OUTCOME: ${{ steps.setup-python.outcome }}
+          DEPENDENCIES_OUTCOME: ${{ steps.install-dependencies.outcome }}
+          WARP_OUTCOME: ${{ steps.warp.outcome }}
+          PROXY_OUTCOME: ${{ steps.proxy.outcome }}
+          RENEW_OUTCOME: ${{ steps.renew.outcome }}
+          STATE_OUTCOME: ${{ steps.state.outcome }}
+          STATE_STATUS: ${{ steps.state.outputs.state_status }}
+          SAVE_OUTCOME: ${{ steps.save-cache.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify-cache.outcome }}
+          VERIFY_HIT: ${{ steps.verify-cache.outputs.cache-hit }}
+          JOB_CANCELLED: ${{ job.status == 'cancelled' }}
+        run: |
+          if ! python3 -m scripts.workflow summary hax 2>/dev/null; then
+            printf '%s\n' '### Hax · 运行摘要' '' '**未能生成详细摘要，请查看失败步骤。**' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: 断开 WARP
         if: always()

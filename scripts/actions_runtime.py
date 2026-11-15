@@ -8,17 +8,24 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from scripts.accounts import register_masks, selected_account, state_key
-from scripts.public_report import iso_date, validate_snapshot
+from scripts.job_summary import (
+    RUNTIME_FILE,
+    empty_details,
+    render_summary,
+    save_runtime,
+    write_summary,
+)
+from scripts.public_report import iso_date, validate_details, validate_snapshot
 
 
 class RunCancelled(Exception):
     """运行被取消。"""
 
 
-def run(platform: str) -> int:
+def run(platform: str, context: Dict[str, Any]) -> int:
     """启动一个账号的续期，并仅发布经过校验的报告。"""
     if platform not in {"hax", "woiden"}:
         raise ValueError("invalid_platform")
@@ -67,11 +74,12 @@ def run(platform: str) -> int:
                         try:
                             worker.wait(timeout=min(heartbeat, remaining))
                         except subprocess.TimeoutExpired:
-                            stage, _ = (
+                            stage, _, details = (
                                 _read_report(report)
                                 if report.exists()
-                                else ("preparing", None)
+                                else ("preparing", None, empty_details())
                             )
+                            context.update(stage=stage, details=details)
                             elapsed = int(time.monotonic() - started)
                             print(
                                 f"platform={platform} account={index} stage={stage} elapsed_seconds={elapsed}",
@@ -79,9 +87,15 @@ def run(platform: str) -> int:
                             )
                 finally:
                     _stop_worker(worker)
-                stage, summary = _read_report(report)
+                stage, summary, details = _read_report(report)
                 if stage != "complete" or summary is None:
                     raise ValueError("missing_result")
+                context.update(
+                    stage=stage,
+                    summary=summary,
+                    details=details,
+                    reason=details["reason"],
+                )
                 value = private / f"{platform}-time-value.txt"
                 if value.exists():
                     if value.stat().st_size > 256:
@@ -101,16 +115,18 @@ def run(platform: str) -> int:
                     f"platform={platform} account={index} stage=complete {counters} elapsed_seconds={elapsed}",
                     flush=True,
                 )
-                _step_summary(platform, index, summary)
                 if worker.returncode and not (
                     summary["failed"] or summary["unverified"]
                 ):
                     print("result=failed category=worker_error", flush=True)
-                return (
+                    context["reason"] = "worker_error"
+                code = (
                     1
                     if worker.returncode or summary["failed"] or summary["unverified"]
                     else 0
                 )
+                context["result"] = "failed" if code else "complete"
+                return code
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
@@ -118,22 +134,73 @@ def run(platform: str) -> int:
 
 def main() -> int:
     """错误路径也仅输出固定错误类别。"""
+    root = Path(__file__).resolve().parent.parent
+    platform = (
+        sys.argv[1]
+        if len(sys.argv) == 2 and sys.argv[1] in {"hax", "woiden"}
+        else "hax"
+    )
+    raw_index = os.environ.get("BATCH_ACCOUNT_INDEX", "1")
+    index = (
+        int(raw_index)
+        if raw_index.isascii() and raw_index.isdigit() and len(raw_index) <= 3
+        else 0
+    )
+    index = index if 1 <= index <= 256 else 0
+    # 统一校验器限制这些混合类型字段，写文件前再次拒绝额外字段和自由文本。
+    context: Dict[str, Any] = dict(
+        version=1,
+        platform=platform,
+        index=index,
+        result="failed",
+        stage="preparing",
+        reason="none",
+        elapsed_seconds=0,
+        summary=None,
+        details=empty_details(),
+    )
+    started = time.monotonic()
     try:
+        (root / RUNTIME_FILE).unlink(missing_ok=True)
         if len(sys.argv) != 2:
             raise ValueError("invalid_arguments")
-        return run(sys.argv[1])
+        return run(sys.argv[1], context)
     except RunCancelled:
+        context.update(result="cancelled", reason="cancelled")
         print("result=failed category=cancelled", flush=True)
         return 130
     except TimeoutError:
+        context["reason"] = "timeout"
         print("result=failed category=timeout", flush=True)
         return 1
     except ValueError:
+        context["summary"] = None
+        context["reason"] = "invalid_configuration_or_report"
         print("result=failed category=invalid_configuration_or_report", flush=True)
         return 1
     except Exception:
+        context["reason"] = "worker_error"
         print("result=failed category=worker_error", flush=True)
         return 1
+    finally:
+        context["elapsed_seconds"] = min(int(time.monotonic() - started), 86400)
+        try:
+            save_runtime(root, context)
+            if os.environ.get("PUBLIC_SUMMARY_DEFERRED") != "1":
+                write_summary(
+                    render_summary(
+                        platform,
+                        index,
+                        {
+                            "RENEW_OUTCOME": "success"
+                            if context["result"] == "complete"
+                            else "failure"
+                        },
+                        root,
+                    )
+                )
+        except Exception:
+            print("result=failed category=summary_unavailable", flush=True)
 
 
 def _seconds(name: str, default: int, maximum: int) -> int:
@@ -169,10 +236,12 @@ def _worker_environment(
     return environment
 
 
-def _read_report(path: Path) -> tuple[str, Dict[str, int] | None]:
+def _read_report(path: Path) -> tuple[str, Dict[str, int] | None, Dict[str, Any]]:
     if not path.is_file() or path.stat().st_size > 4096:
         raise ValueError("invalid_report")
-    return validate_snapshot(json.loads(path.read_text(encoding="utf-8")))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    stage, summary = validate_snapshot(value)
+    return stage, summary, validate_details(value["details"])
 
 
 def _cancel(signum: int, frame: object) -> None:
@@ -234,16 +303,6 @@ def _stop_worker(worker: subprocess.Popen) -> None:
         os.killpg(worker.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-
-
-def _step_summary(platform: str, index: int, summary: Dict[str, int]) -> None:
-    target = os.environ.get("GITHUB_STEP_SUMMARY")
-    if target:
-        with Path(target).open("a", encoding="utf-8") as output:
-            output.write(f"### {platform} account {index}\n\n")
-            output.write("| Result | Count |\n| --- | --- |\n")
-            for key, count in summary.items():
-                output.write(f"| {key} | {count} |\n")
 
 
 if __name__ == "__main__":

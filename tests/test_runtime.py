@@ -82,7 +82,7 @@ class RuntimeTests(unittest.TestCase):
             {
                 "BATCH": ACCOUNT + ";" + SECOND,
                 "BATCH_ACCOUNT_INDEX": "2",
-                "GITHUB_OUTPUT": str(self.root / "output"),
+                "GITHUB_OUTPUT": str(self.root / "github-output"),
                 "GITHUB_ENV": str(self.root / "environment"),
                 "GITHUB_STEP_SUMMARY": str(self.root / "summary"),
                 "TEST_LOCATION": str(self.root / "location"),
@@ -117,9 +117,9 @@ sys.exit(publish_results([{"username": fields[0], "servers": [{"old_valid_until"
         self.assertIn("retries=2", result.stdout)
         for value in ("OTP_12345", "host.private.invalid", "2001:db8::1234"):
             self.assertNotIn(value, result.stdout + result.stderr)
-        self.assertFalse((self.root / "output").exists())
+        self.assertFalse((self.root / "github-output").exists())
         self.assertFalse((self.root / "environment").exists())
-        self.assertIn("renewed", (self.root / "summary").read_text())
+        self.assertIn("已延长 1 台", (self.root / "summary").read_text())
         self.assertEqual(
             (self.root / "hax-time-value.txt").read_text(),
             f"{state_key('+1-5550005678')},2026-11-20\n",
@@ -206,7 +206,19 @@ sys.exit(publish_results([{"username": fields[0], "servers": [{"old_valid_until"
             0,
         )
         summary["renewed"] = 1
-        valid = {"version": 1, "stage": "complete", "summary": summary}
+        valid = {
+            "version": 2,
+            "stage": "complete",
+            "summary": summary,
+            "details": {
+                "account_failures": 0,
+                "text_sent": 0,
+                "text_failed": 0,
+                "photo_sent": 0,
+                "photo_failed": 0,
+                "reason": "none",
+            },
+        }
         cases = [
             {**valid, "secret": "FAKE_SESSION"},
             {**valid, "stage": "FAKE_SESSION"},
@@ -214,6 +226,10 @@ sys.exit(publish_results([{"username": fields[0], "servers": [{"old_valid_until"
             {**valid, "summary": {**summary, "renewed": True}},
             {**valid, "summary": {**summary, "renewed": 1_000_001}},
             {**valid, "summary": {**summary, "extra": 0}},
+            {**valid, "details": {**valid["details"], "secret": "FAKE_SESSION"}},
+            {**valid, "details": {**valid["details"], "reason": "FAKE_SESSION"}},
+            {**valid, "details": {**valid["details"], "text_sent": True}},
+            {**valid, "details": {**valid["details"], "account_failures": 1}},
         ]
         for report in cases:
             with self.subTest(report=report):

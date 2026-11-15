@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from DrissionPage import ChromiumPage, ChromiumOptions
 from gen_singbox_config import setup_proxy
-from scripts.public_report import publish_progress, publish_results, renewal_verified, screenshot_allowed
+from scripts.public_report import publish_progress, publish_results, record_notification, renewal_verified, screenshot_allowed
+from scripts.telegram import telegram_accepted
 
 # ── 可选依赖：reCAPTCHA 语音识别 ──────────────────────────────────────
 try:
@@ -1508,9 +1509,10 @@ def notify(result: dict, username: str, tg_token: str = None, tg_chat: str = Non
                 text += f"📎 详情: {detail}\n"
         if server_online:
             text += f"🌐 {server_online}\n"
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=30)
-        print("  [INFO] TG推送成功")
+        if send_tg_message(token, chat, text):
+            print("  [INFO] TG推送成功")
+        else:
+            print("  [WARN] TG推送失败")
     except Exception as e:
         print(f"  [WARN] TG推送失败: {e}")
 
@@ -1532,9 +1534,10 @@ def notify_provisioning(username: str, img: str = None, tg_token: str = None, tg
         )
         if img and Path(img).exists():
             send_tg_photo(token, chat, img, "🖥️ 当前 VPS 状态截图")
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=30)
-        print("  [INFO] TG推送成功（排队/开机中）")
+        if send_tg_message(token, chat, text):
+            print("  [INFO] TG推送成功（排队/开机中）")
+        else:
+            print("  [WARN] TG推送失败（排队/开机中）")
     except Exception as e:
         print(f"  [WARN] TG推送失败: {e}")
 
@@ -1556,9 +1559,10 @@ def notify_no_server(username: str, img: str = None, tg_token: str = None, tg_ch
         )
         if img and Path(img).exists():
             send_tg_photo(token, chat, img, "🖥️ 当前 VPS 状态截图")
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=30)
-        print("  [INFO] TG推送成功（无可用服务器）")
+        if send_tg_message(token, chat, text):
+            print("  [INFO] TG推送成功（无可用服务器）")
+        else:
+            print("  [WARN] TG推送失败（无可用服务器）")
     except Exception as e:
         print(f"  [WARN] TG推送失败: {e}")
 
@@ -1578,12 +1582,9 @@ def notify_login_fail(username: str, img: str = None, tg_token: str = None, tg_c
             f"❌ 登录失败\n"
         )
         if img and Path(img).exists():
-            with open(img, "rb") as f:
-                requests.post(f"https://api.telegram.org/bot{token}/sendPhoto",
-                    data={"chat_id": chat, "caption": text, "parse_mode": "HTML"}, files={"photo": f}, timeout=60)
+            send_tg_photo(token, chat, img, text)
         else:
-            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=30)
+            send_tg_message(token, chat, text)
     except: pass
 
 def parse_accounts(s: str) -> List[Dict[str, str]]:
@@ -3102,6 +3103,7 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
         if renew_attempt > 1:
             print(f"  [INFO] 续期重试 {renew_attempt}/{MAX_RENEW_RETRIES_PER_URL}...")
 
+        result["public_reason"] = "renewal_failed"
         try:
             # 1. 填写表单并提交
             _renew_fill_form(browser, idx, sid_f)
@@ -3116,8 +3118,10 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
             # 入口点击可通过代理完成，但验证码和最后提交必须使用同一 WARP 出口。
             print("  [INFO] 已进入最终续期页面，切换为 WARP 直连浏览器...")
             if not restart_warp(proxy):
+                result["public_reason"] = "warp_failed"
                 raise CaptchaBlocked("最终续期页面 WARP 切换失败")
             if not handoff_browser_to_warp(browser, HAX_VPS_RENEW_CODE_URL):
+                result["public_reason"] = "warp_failed"
                 raise CaptchaBlocked("最终续期页面 WARP 直连浏览器重建失败")
 
             # 新浏览器重新打开页面后，验证码图片和 Turnstile 都是新的，不能复用旧页面状态。
@@ -3140,7 +3144,9 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
             print("  [INFO] ✅ 最终续期页面已切换为 WARP 直连并重新完成算术验证码")
 
             # 5. 获取 TG 验证码
+            result["public_reason"] = "renewal_code_unavailable"
             code = _renew_get_code(code_holder, tg_thread)
+            result["public_reason"] = "renewal_failed"
 
             # 6. 提交验证码页面 + 检查结果（captcha 错误时内层重试）
             for code_attempt in range(1, MAX_WARP_RETRIES + 1):
@@ -3157,6 +3163,7 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
                     print(f"  [INFO] captcha 错误，换 WARP IP 后重试 ({code_attempt}/{MAX_WARP_RETRIES})...")
                     if _renew_refresh_code_page_after_captcha(browser, idx, sid_f, proxy):
                         continue  # 新 IP + 新验证码页面后重试 _submit_code_page
+                    result["public_reason"] = "warp_failed"
                     result["message"] = "续期失败: captcha 被服务器拒绝，WARP 换 IP 失败"
                     result["detailMessage"] = "captcha 被服务器拒绝，WARP 换 IP 失败"
                     break
@@ -3186,6 +3193,8 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
                 if restart_warp(proxy) and handoff_browser_to_warp(browser):
                     time.sleep(5)
                     continue
+            if result.get("public_reason") != "warp_failed":
+                result["public_reason"] = "captcha_failed"
             result["message"] = f"验证码失败: {e}"
             break
         except Exception as e:
@@ -3224,6 +3233,7 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
     login_ok = hax_login_flow(browser, phone, idx, proxy=proxy)
     if not login_ok:
         result["message"] = "登录失败"
+        result["public_reason"] = "login_failed"
         notify_login_fail(phone, tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info,
                           phone_mask=result.get("phoneMask", ""))
         return result
@@ -3474,44 +3484,47 @@ def get_warp_manager() -> WarpManager:
 
 
 def send_tg_message(tg_token, tg_chat, message):
+    publish_progress("notifying")
+    sent = False
     for attempt in range(3):
         try:
-            requests.post(
+            response = requests.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
                 data={"chat_id": tg_chat, "text": message, "parse_mode": "HTML"},
                 proxies={"http": None, "https": None},
                 timeout=30,
             )
-            return True
-        except Exception as e:
+            sent = telegram_accepted(response)
+            break
+        except Exception:
             if attempt < 2:
                 time.sleep(2)
-            else:
-                print(f"[WARN] TG 消息发送失败: {e}")
-    return False
+    record_notification("text", sent)
+    return sent
 
 
 def send_tg_photo(tg_token, tg_chat, photo_path, caption=""):
     if not os.path.isfile(photo_path):
-        print(f"[WARN] 截图不存在: {photo_path}")
         return False
+    publish_progress("notifying")
+    sent = False
     for attempt in range(3):
         try:
             with open(photo_path, "rb") as f:
-                resp = requests.post(
+                response = requests.post(
                     f"https://api.telegram.org/bot{tg_token}/sendPhoto",
                     data={"chat_id": tg_chat, "caption": caption, "parse_mode": "HTML"},
                     files={"photo": f},
                     proxies={"http": None, "https": None},
                     timeout=30,
                 )
-            return resp.status_code == 200
-        except Exception as e:
+            sent = telegram_accepted(response)
+            break
+        except Exception:
             if attempt < 2:
                 time.sleep(2)
-            else:
-                print(f"[WARN] TG 截图发送失败: {e}")
-    return False
+    record_notification("photo", sent)
+    return sent
 
 
 def _send_tg_report(results, masked_phone, tg_token, tg_chat, ip_info):
