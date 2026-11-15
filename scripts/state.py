@@ -1,15 +1,14 @@
-"""仅以不透明账号标识公开到期日，Git 操作不转发原始输出。"""
+"""校验每账号缓存，只从本轮可靠结果生成下一份快照。"""
 
-import base64
-import os
+import json
 import re
-import subprocess
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
 from scripts.accounts import public_account_id, state_key
 from scripts.public_report import iso_date
+
+CACHE_FILE = Path("output/renewal-state.json")
 
 
 def read_observed_state(path: Path, fields: Sequence[str]) -> str | None:
@@ -25,117 +24,53 @@ def read_observed_state(path: Path, fields: Sequence[str]) -> str | None:
     return state
 
 
-def read_repository_state(path: Path) -> dict[str, str]:
-    """读取公开行格式，旧手机号短索引不作为当前账号的记录。"""
+def read_cached_state(path: Path, platform: str, account: str) -> str | None:
+    """只接受本平台、本账号的固定结构；缓存缺失时返回 None。"""
+    if platform not in {"hax", "woiden"} or not re.fullmatch(r"[a-f0-9]{64}", account):
+        raise ValueError("invalid_state")
     try:
-        if path.stat().st_size > 65536:
-            raise ValueError("invalid_state")
-        lines = path.read_text(encoding="utf-8").splitlines()
+        if path.stat().st_size > 4096:
+            raise ValueError("invalid_cache")
+        value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
-    records = {}
-    for line in lines:
-        if not line.strip():
-            continue
-        key, state = line.strip().split(",")
-        if state != "NOVPS" and iso_date(state) is None:
-            raise ValueError("invalid_state")
-        if re.fullmatch(r"[a-f0-9]{8}", key):
-            continue
-        if not re.fullmatch(r"[a-f0-9]{64}", key) or key in records:
-            raise ValueError("invalid_state")
-        records[key] = state
-    return records
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "platform", "account", "state"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["platform"] != platform
+        or value["account"] != account
+        or not isinstance(value["state"], str)
+        or (value["state"] != "NOVPS" and iso_date(value["state"]) is None)
+    ):
+        raise ValueError("invalid_cache")
+    return value["state"]
 
 
-def save_repository_state(root: Path, platform: str, fields: Sequence[str]) -> str:
-    """只更新 master 中本账号的公开行，并发冲突时重新读取后重试。"""
+def prepare_cached_state(
+    path: Path,
+    observed: Path,
+    platform: str,
+    fields: Sequence[str],
+    restored: bool = True,
+) -> str:
+    """校验本轮导出后按需更新本地快照，远端传输交给官方 Cache Action。"""
     account = public_account_id(platform, fields)
-    filename = f"{platform}-time.txt"
-    state = read_observed_state(root / f"{platform}-time-value.txt", fields)
+    state = read_observed_state(observed, fields)
     if state is None:
         return "no_observed_state"
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("GITHUB_", "ACTIONS_", "GIT_CONFIG_"))
-        and key
-        not in {
-            "BATCH",
-            "PROXY_CONTENT",
-            "TWOCAPTCHA_API_KEY",
-            "GH_TOKEN",
-            "STATE_WRITE_TOKEN",
-        }
-    }
-    environment["GIT_TERMINAL_PROMPT"] = "0"
-    token = os.environ.get("STATE_WRITE_TOKEN", "")
-    if token:
-        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        environment.update(
-            GIT_CONFIG_COUNT="1",
-            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
-            GIT_CONFIG_VALUE_0=f"AUTHORIZATION: basic {auth}",
-        )
-    remote = _git(root, ["remote", "get-url", "origin"], environment).strip()
-    with tempfile.TemporaryDirectory(prefix="renewal-state-") as temporary:
-        checkout = Path(temporary)
-        _git(checkout, ["init", "--quiet"], environment)
-        for _attempt in range(3):
-            _git(
-                checkout, ["fetch", "--quiet", remote, "refs/heads/master"], environment
-            )
-            _git(
-                checkout,
-                ["checkout", "--quiet", "--detach", "--force", "FETCH_HEAD"],
-                environment,
-            )
-            path = checkout / filename
-            records = read_repository_state(path)
-            if records.get(account) == state:
-                return "unchanged"
-            records[account] = state
-            path.write_text(
-                "".join(f"{key},{records[key]}\n" for key in sorted(records)),
-                encoding="utf-8",
-            )
-            _git(checkout, ["add", "--", filename], environment)
-            _git(
-                checkout,
-                [
-                    "-c",
-                    "user.name=github-actions[bot]",
-                    "-c",
-                    "user.email=github-actions[bot]@users.noreply.github.com",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    f"chore: 更新 {platform} 到期日记录",
-                ],
-                environment,
-            )
-            try:
-                _git(
-                    checkout,
-                    ["push", "--quiet", remote, "HEAD:refs/heads/master"],
-                    environment,
-                )
-                return "saved"
-            except subprocess.CalledProcessError:
-                # 下次重新获取 master，仅修改自己的行，不覆盖其他账号的记录。
-                continue
-    raise ValueError("state_save_failed")
-
-
-def _git(root: Path, arguments: list[str], environment: dict[str, str]) -> str:
-    return subprocess.run(
-        ["git", *arguments],
-        cwd=root,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=True,
-        timeout=60,
-    ).stdout
+    try:
+        previous = read_cached_state(path, platform, account) if restored else None
+    except (ValueError, OSError, UnicodeError):
+        previous = None
+    if previous == state:
+        return "unchanged"
+    snapshot = dict(version=1, platform=platform, account=account, state=state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(snapshot, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+    return "changed"

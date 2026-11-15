@@ -1,213 +1,134 @@
-"""用本地 Git 远端和假凭据验证公开状态及并发回写。"""
+"""从公开接口验证缓存归属、数据校验和本轮结果保存。"""
 
-import os
-import shutil
-import subprocess
-import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from scripts.accounts import public_account_id, state_key
-from scripts.state import (
-    read_observed_state,
-    read_repository_state,
-    save_repository_state,
-)
-from tests.test_runtime import ACCOUNT, SECOND, environment
+from scripts.state import prepare_cached_state, read_cached_state
+from tests.test_runtime import ACCOUNT, SECOND
 
 
 class StateTests(unittest.TestCase):
-    """所有提交只进入临时本地仓库，不访问 GitHub。"""
+    """仅使用临时文件和假凭据，不执行 Git 或远程请求。"""
 
     def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="hax-test-git-state-")
+        temporary = tempfile.TemporaryDirectory(prefix="hax-test-state-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.work = self.root / "work"
-        self.work.mkdir()
-        self.remote = self.root / "remote.git"
+        self.path = self.root / "cached.json"
+        self.observed = self.root / "observed.txt"
         self.fields = ACCOUNT.split(",")
-        self.other = SECOND.split(",")
         self.account = public_account_id("hax", self.fields)
-        self.env = environment()
-        self.env.update(
-            GIT_AUTHOR_NAME="Test",
-            GIT_AUTHOR_EMAIL="test@example.invalid",
-            GIT_COMMITTER_NAME="Test",
-            GIT_COMMITTER_EMAIL="test@example.invalid",
-        )
-        real_git = shutil.which("git")
-        assert real_git
-        self.real_git = real_git
 
-    def git(self, *arguments: str, root: Path | None = None) -> str:
-        """只在测试仓库执行 Git，测试进程自身也不转发命令输出。"""
-        result = subprocess.run(
-            [self.real_git, *arguments],
-            cwd=root or self.work,
-            env=self.env,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=20,
-        )
-        return result.stdout.strip()
+    def observe(self, state: str = "2026-12-01") -> None:
+        """写入第一组执行入口约定的本账号结果格式。"""
+        self.observed.write_text(f"{state_key(self.fields[0])},{state}\n")
 
-    def repository(self) -> None:
-        """创建含原版短索引的远端，用来验证首次公开回写。"""
-        self.git("init", "--bare", str(self.remote))
-        self.git("init", "-b", "master")
-        (self.work / "hax-time.txt").write_text("deadbeef,2026-12-01\n")
-        (self.work / "kept.txt").write_text("original\n")
-        self.git("add", "hax-time.txt", "kept.txt")
-        self.git("commit", "-m", "seed")
-        self.git("remote", "add", "origin", str(self.remote))
-        self.git("push", "origin", "master")
-
-    def observe(
-        self, state: str = "2026-12-01", platform: str = "hax", account: str = ACCOUNT
-    ) -> None:
-        """模拟受控执行入口的内部交接文件。"""
-        (self.work / f"{platform}-time-value.txt").write_text(
-            f"{state_key(account.split(',')[0])},{state}\n"
-        )
-
-    def save(self, platform: str = "hax", account: str = ACCOUNT) -> str:
-        with patch.dict(os.environ, self.env, clear=True):
-            return save_repository_state(self.work, platform, account.split(","))
-
-    def test_public_identity_separates_accounts_platforms_and_session_rotation(
+    def test_identity_separates_platforms_and_accounts_without_plain_credentials(
         self,
     ) -> None:
         self.assertRegex(self.account, r"^[a-f0-9]{64}$")
-        self.assertNotEqual(self.account, public_account_id("hax", self.other))
+        self.assertNotEqual(self.account, public_account_id("hax", SECOND.split(",")))
         self.assertNotEqual(self.account, public_account_id("woiden", self.fields))
-        self.assertNotEqual(
-            self.account,
-            public_account_id("hax", [*self.fields[:-1], "ROTATED_SESSION"]),
+        rotated = [*self.fields[:-1], "ROTATED_FAKE_SESSION"]
+        self.assertNotEqual(self.account, public_account_id("hax", rotated))
+        changed_bot = [*self.fields]
+        changed_bot[1] = "OTHER_FAKE_BOT"
+        self.assertEqual(self.account, public_account_id("hax", changed_bot))
+        for secret in self.fields + [state_key(self.fields[0])]:
+            self.assertNotIn(secret, self.account)
+
+    def test_round_trip_only_contains_validated_state_and_opaque_identity(self) -> None:
+        for state in ("2026-12-01", "NOVPS"):
+            with self.subTest(state=state):
+                self.observe(state)
+                self.assertEqual(
+                    prepare_cached_state(self.path, self.observed, "hax", self.fields),
+                    "changed",
+                )
+                self.assertEqual(
+                    read_cached_state(self.path, "hax", self.account), state
+                )
+                text = self.path.read_text()
+                self.assertEqual(
+                    set(json.loads(text)), {"version", "platform", "account", "state"}
+                )
+                for secret in self.fields + [state_key(self.fields[0])]:
+                    self.assertNotIn(secret, text)
+
+    def test_unchanged_or_missing_result_keeps_existing_snapshot(self) -> None:
+        self.observe()
+        prepare_cached_state(self.path, self.observed, "hax", self.fields)
+        original = self.path.read_bytes()
+        self.assertEqual(
+            prepare_cached_state(self.path, self.observed, "hax", self.fields),
+            "unchanged",
         )
-        changed = [*self.fields]
-        changed[1] = "CHANGED_BOT"
-        self.assertEqual(self.account, public_account_id("hax", changed))
-        for value in self.fields + [state_key(self.fields[0])]:
-            self.assertNotIn(value, self.account)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.observed.unlink()
+        self.assertEqual(
+            prepare_cached_state(self.path, self.observed, "hax", self.fields),
+            "no_observed_state",
+        )
+        self.assertEqual(self.path.read_bytes(), original)
 
-    def test_legacy_records_are_not_used_and_invalid_public_rows_are_rejected(
-        self,
-    ) -> None:
-        path = self.root / "state.txt"
-        self.assertEqual(read_repository_state(path), {})
-        path.write_text(f"deadbeef,2099-12-31\n{self.account},NOVPS\n")
-        self.assertEqual(read_repository_state(path), {self.account: "NOVPS"})
-        for body in (
+    def test_wrong_or_invalid_observed_result_cannot_replace_snapshot(self) -> None:
+        self.observe()
+        prepare_cached_state(self.path, self.observed, "hax", self.fields)
+        original = self.path.read_bytes()
+        for text in (
             "FAKE_SESSION",
-            f"{self.account},bad-date",
-            f"{self.account},NOVPS\n{self.account},NOVPS",
-            "x" * 65537,
-        ):
-            with self.subTest(body=body):
-                path.write_text(body)
-                with self.assertRaises(ValueError):
-                    read_repository_state(path)
-
-    def test_observation_must_match_current_account_and_have_valid_state(self) -> None:
-        path = self.work / "hax-time-value.txt"
-        self.assertIsNone(read_observed_state(path, self.fields))
-        for body in (
-            "FAKE_SESSION",
-            f"{state_key(self.other[0])},NOVPS",
-            f"{state_key(self.fields[0])},2026-02-30",
+            f"{state_key(SECOND.split(',')[0])},2026-12-02",
+            f"{state_key(self.fields[0])},bad-date",
             "x" * 257,
         ):
-            with self.subTest(body=body):
-                path.write_text(body)
+            with self.subTest(text=text):
+                self.observed.write_text(text)
                 with self.assertRaises(ValueError):
-                    read_observed_state(path, self.fields)
-        self.observe("NOVPS")
-        self.assertEqual(read_observed_state(path, self.fields), "NOVPS")
+                    prepare_cached_state(self.path, self.observed, "hax", self.fields)
+                self.assertEqual(self.path.read_bytes(), original)
 
-    def test_missing_or_wrong_result_cannot_write_and_same_result_adds_no_commit(
-        self,
-    ) -> None:
-        self.assertEqual(self.save(), "no_observed_state")
-        self.repository()
-        before = self.git("rev-parse", "master", root=self.remote)
-        self.observe(account=SECOND)
+    def test_bad_cache_schema_or_binding_is_rejected(self) -> None:
+        valid = dict(
+            version=1, platform="hax", account=self.account, state="2026-12-01"
+        )
+        bad = [
+            [],
+            {**valid, "version": True},
+            {**valid, "version": 2},
+            {**valid, "platform": "woiden"},
+            {**valid, "account": public_account_id("hax", SECOND.split(","))},
+            {**valid, "state": "2026-02-30"},
+            {**valid, "state": False},
+            {**valid, "extra": "FAKE_SESSION"},
+        ]
+        for value in bad:
+            with self.subTest(value=value):
+                self.path.write_text(json.dumps(value))
+                with self.assertRaises(ValueError):
+                    read_cached_state(self.path, "hax", self.account)
+        self.path.write_text("x" * 4097)
         with self.assertRaises(ValueError):
-            self.save()
-        self.assertEqual(self.git("rev-parse", "master", root=self.remote), before)
-        self.observe()
-        self.assertEqual(self.save(), "saved")
-        saved = self.git("rev-parse", "master", root=self.remote)
-        self.assertEqual(self.save(), "unchanged")
-        self.assertEqual(self.git("rev-parse", "master", root=self.remote), saved)
+            read_cached_state(self.path, "hax", self.account)
 
-    def test_writes_only_opaque_rows_and_keeps_working_files_and_other_accounts(
-        self,
-    ) -> None:
-        self.repository()
-        (self.work / "kept.txt").write_text("uncommitted user changes\n")
-        for platform in ("hax", "woiden"):
-            for account in (ACCOUNT, SECOND):
-                self.observe(platform=platform, account=account)
-                self.assertEqual(self.save(platform, account), "saved")
-            text = self.git("show", f"master:{platform}-time.txt", root=self.remote)
-            for value in (
-                self.fields
-                + self.other
-                + [state_key(self.fields[0]), state_key(self.other[0]), "deadbeef"]
-            ):
-                self.assertNotIn(value, text)
-            self.assertEqual(len(text.splitlines()), 2)
+    def test_valid_observation_rebuilds_bad_or_untrusted_cache(self) -> None:
+        self.observe()
+        self.path.write_text("FAKE_SESSION,bad-date")
         self.assertEqual(
-            (self.work / "kept.txt").read_text(), "uncommitted user changes\n"
+            prepare_cached_state(self.path, self.observed, "hax", self.fields),
+            "changed",
         )
         self.assertEqual(
-            self.git("rev-list", "--count", "master", root=self.remote), "5"
+            read_cached_state(self.path, "hax", self.account), "2026-12-01"
         )
-        self.assertEqual(self.git("rev-list", "--count", "master"), "1")
-
-    def test_concurrent_remote_update_is_preserved_after_retry(self) -> None:
-        self.repository()
-        competitor = self.root / "competitor"
-        self.git("clone", "--branch", "master", str(self.remote), str(competitor))
-        other_id = public_account_id("hax", self.other)
-        (competitor / "hax-time.txt").write_text(f"{other_id},2026-12-02\n")
-        self.git("add", "hax-time.txt", root=competitor)
-        self.git("commit", "-m", "concurrent update", root=competitor)
-        binary = self.root / "bin"
-        binary.mkdir()
-        marker = self.root / "injected"
-        wrapper = binary / "git"
-        wrapper.write_text(
-            f"#!{sys.executable}\nimport os, subprocess, sys\nfrom pathlib import Path\n"
-            f"real = {self.real_git!r}\nmarker = Path({str(marker)!r})\n"
-            "if sys.argv[1] == 'push' and not marker.exists():\n"
-            "    marker.touch()\n"
-            f"    subprocess.run([real, 'push', 'origin', 'master'], cwd={str(competitor)!r}, check=True, capture_output=True)\n"
-            "os.execv(real, [real, *sys.argv[1:]])\n"
+        self.assertEqual(
+            prepare_cached_state(
+                self.path, self.observed, "hax", self.fields, restored=False
+            ),
+            "changed",
         )
-        wrapper.chmod(0o700)
-        self.env["PATH"] = str(binary) + os.pathsep + self.env["PATH"]
-        self.observe()
-        self.assertEqual(self.save(), "saved")
-        text = self.git("show", "master:hax-time.txt", root=self.remote)
-        self.assertIn(f"{other_id},2026-12-02", text)
-        self.assertIn(f"{self.account},2026-12-01", text)
-        self.assertTrue(marker.exists())
-
-    def test_rejected_push_keeps_remote_state(self) -> None:
-        self.repository()
-        hook = self.remote / "hooks" / "pre-receive"
-        hook.write_text("#!/bin/sh\necho FAKE_SESSION >&2\nexit 1\n")
-        hook.chmod(0o700)
-        before = self.git("rev-parse", "master", root=self.remote)
-        self.observe()
-        with self.assertRaises(ValueError):
-            self.save()
-        self.assertEqual(self.git("rev-parse", "master", root=self.remote), before)
 
 
 if __name__ == "__main__":

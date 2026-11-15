@@ -17,6 +17,9 @@ output/
 screenshots/
 *.log
 *-time-value.txt
+# 到期日已改存 Actions 缓存，旧状态文件不再使用
+/hax-time.txt
+/woiden-time.txt
 sing-box
 sing-box_config.json
 socks5_proxy.txt

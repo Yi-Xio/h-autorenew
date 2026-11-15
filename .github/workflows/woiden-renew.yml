@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  # 这里只生成数字序号，各账号独立预筛；凭据不进入任务名。
+  # 这里只生成数字序号；各账号恢复自己的缓存后独立预筛。
   build-matrix:
     if: github.ref == 'refs/heads/master'
     environment: renewal
@@ -33,7 +33,7 @@ jobs:
     if: github.ref == 'refs/heads/master'
     environment: renewal
     permissions:
-      contents: write
+      contents: read
       actions: write
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -61,10 +61,30 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: 准备账号缓存
+        id: cache-key
+        env:
+          BATCH: ${{ secrets.BATCH }}
+        run: python3 -m scripts.workflow setup-cache woiden
+
+      # 每轮都恢复本账号缓存，全部跳过时也保持访问。
+      - name: 恢复账号状态
+        id: restore-cache
+        uses: actions/cache/restore@v6
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+        with:
+          path: output/renewal-state.json
+          key: ${{ steps.cache-key.outputs.cache_key }}
+          restore-keys: ${{ steps.cache-key.outputs.cache_prefix }}
+
       - name: 判断本账号是否需要运行
         id: decide
         env:
           BATCH: ${{ secrets.BATCH }}
+          CACHE_RESTORE_OUTCOME: ${{ steps.restore-cache.outcome }}
         run: python3 -m scripts.workflow check woiden
 
       - name: 通知跳过的账号
@@ -133,14 +153,25 @@ jobs:
           TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
         run: python3 -m scripts.actions_runtime woiden
 
-      # 文件仍保存到期日；原始 worker 输出与凭据不会进入提交。
-      - name: 保存账户到期日
+      # 只保存本轮可靠结果，失败或待核实时仍可保存已知日期。
+      # 不同账号使用独立 key；保存失败时远端旧快照继续保留。
+      - name: 准备账户状态
         id: state
         if: always() && !cancelled() && (steps.renew.outcome == 'success' || steps.renew.outcome == 'failure')
         env:
           BATCH: ${{ secrets.BATCH }}
-          STATE_WRITE_TOKEN: ${{ github.token }}
-        run: python3 -m scripts.workflow save-state woiden
+          CACHE_RESTORE_OUTCOME: ${{ steps.restore-cache.outcome }}
+        run: python3 -m scripts.workflow prepare-state woiden
+
+      - name: 保存账号状态缓存
+        id: save-cache
+        if: always() && !cancelled() && steps.state.outputs.changed == 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          path: output/renewal-state.json
+          key: ${{ steps.cache-key.outputs.cache_key }}
 
       - name: 断开 WARP
         if: always()
