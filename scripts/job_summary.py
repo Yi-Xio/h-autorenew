@@ -38,6 +38,10 @@ REASON_LABELS = {
     "captcha_failed": "验证码处理失败",
     "renewal_code_unavailable": "未获取到续期验证码",
     "warp_failed": "WARP 切换失败",
+    "warp_registration_failed": "WARP 注册失败",
+    "warp_connection_failed": "未能核实 WARP 连接",
+    "warp_ip_query_failed": "未取得有效的 WARP 出口 IP",
+    "warp_new_exit_unavailable": "未取得新的 WARP 出口",
     "timeout": "续期脚本运行超时",
     "cancelled": "执行已取消",
     "worker_error": "续期进程异常退出",
@@ -257,6 +261,10 @@ def render_summary(
         "captcha_failed": "验证码处理",
         "renewal_code_unavailable": "等待续期验证码",
         "warp_failed": "切换 WARP",
+        "warp_registration_failed": "注册 WARP",
+        "warp_connection_failed": "核实 WARP 连接",
+        "warp_ip_query_failed": "查询 WARP 出口",
+        "warp_new_exit_unavailable": "更换 WARP 出口",
     }.get(reason)
     if (
         details["text_failed"]

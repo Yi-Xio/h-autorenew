@@ -5,12 +5,21 @@ import os, sys, time, platform, requests, re, json, subprocess, socket, threadin
 os.environ["PATH"] = os.path.expanduser("~/bin") + os.pathsep + os.environ.get("PATH", "")
 import tempfile, html as html_mod, random
 from datetime import datetime, timezone, timedelta, date
+from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from DrissionPage import ChromiumPage, ChromiumOptions
 from gen_singbox_config import setup_proxy
-from scripts.public_report import publish_progress, publish_results, record_notification, renewal_verified, screenshot_allowed
+from scripts.public_report import (
+    WARP_FAILURE_REASONS,
+    publish_progress,
+    publish_results,
+    record_notification,
+    renewal_verified,
+    screenshot_allowed,
+)
 from scripts.telegram import telegram_accepted
+from scripts.job_summary import REASON_LABELS
 
 # ── 可选依赖：reCAPTCHA 语音识别 ──────────────────────────────────────
 try:
@@ -57,13 +66,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 #     （对应日志"轮换尝试 x/N"）。Cloudflare 立即重注册常返回同一出口 IP，
 #     所以每轮之间递增等待 5/10/15/20s 再试。
 #     ★ 20 轮都拿不到新 IP → 本次换 IP 失败 → 中层本轮直接终止，
-#       向上抛 CaptchaBlocked；下一轮中层/外层重试时会重新执行一次完整的
-#       20 轮轮换（而不是接着第 21 轮继续）。
+#       以固定 WARP 原因停止本次续期，不用原出口继续提交。
 #
 # 时序示例（MAX_WARP_RETRIES=10, MAX_WARP_ROTATE_ATTEMPTS=20）：
 #   提交验证码 → 被拒 → 换IP(内部最多20轮重注册)
 #     ├─ 第3轮拿到新IP → 用新IP重新提交（内层只消耗了3轮）
-#     └─ 20轮全是重复IP → 本次提交失败 → 外层整体重跑时再开一轮新的20轮
+#     └─ 20轮全是重复IP → 未取得新出口 → 停止本次续期
 # ════════════════════════════════════════════════════════════════════
 # 账号列表："手机号,tg_bot_token,tg_chat_id,tg_api_id,tg_api_hash,tg_session"，多账号用分号分隔
 BATCH = os.environ.get("BATCH", "")
@@ -76,8 +84,8 @@ MAX_RENEW_RETRIES_PER_URL = int(os.environ.get("MAX_RENEW_RETRIES", "5").strip()
 MAX_WARP_RETRIES = int(os.environ.get("MAX_WARP_RETRIES", "20").strip())
 # 【内层】单次换 IP 内部的 warp-cli 重注册轮数。
 # Cloudflare 立即重注册往往返回同一出口 IP，因此每轮之间递增等待 5/10/15/20s；
-# 全部轮次都拿不到新 IP 时本次换 IP 失败，向上抛 CaptchaBlocked，
-# 由下一轮中层/外层重试重新开始一轮完整的轮换（不是续着上一轮继续）。
+# 全部轮次都拿不到新 IP 时本次换 IP 失败，向上抛 WarpError，
+# 不再用未满足换出口要求的网络继续本次续期。
 MAX_WARP_ROTATE_ATTEMPTS = int(os.environ.get("MAX_WARP_ROTATE_ATTEMPTS", "20").strip())
 # 单条 warp-cli 命令的超时秒数（正常执行 1-2s；超时说明网络已断/挂起，
 # 会强杀整个进程组防止孤儿 warp-cli 卡住管道，然后由轮换循环继续下一轮）
@@ -571,6 +579,16 @@ class DPBrowser:
     def quit(self):
         try: self.page.quit()
         except Exception: pass
+
+class WarpError(RuntimeError):
+    """WARP 失败只携带固定原因，不保留命令输出或出口信息。"""
+
+    def __init__(self, reason: str):
+        if reason not in WARP_FAILURE_REASONS:
+            raise ValueError("invalid_warp_reason")
+        self.reason = reason
+        super().__init__(REASON_LABELS[reason])
+
 
 class CaptchaBlocked(Exception):
     """IP 被 Google reCAPTCHA 封锁"""
@@ -2338,7 +2356,7 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                     print(f"  [WARN] reCAPTCHA 被封锁: {e}")
                     if attempt < max_retries:
                         print("  [INFO] 重启 WARP 换 IP，刷新验证码页面重试...")
-                        if restart_warp(proxy) and handoff_browser_to_warp(browser):
+                        if restart_warp() and handoff_browser_to_warp(browser):
                             time.sleep(5)
                         # 刷新 vps-renew-code 页面，复用 TG 验证码
                         browser.open(HAX_VPS_RENEW_CODE_URL)
@@ -2371,7 +2389,7 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                     print(f"  [WARN] reCAPTCHA 求解异常: {e}")
                     if attempt < max_retries:
                         print("  [INFO] 重启 WARP 换 IP，刷新验证码页面重试...")
-                        if restart_warp(proxy) and handoff_browser_to_warp(browser):
+                        if restart_warp() and handoff_browser_to_warp(browser):
                             time.sleep(5)
                         browser.open(HAX_VPS_RENEW_CODE_URL)
                         time.sleep(5)
@@ -2776,9 +2794,7 @@ def _renew_refresh_code_page_after_captcha(browser, idx: int, sid_f: str,
                                            proxy: str = None) -> bool:
     """服务器拒绝 captcha 后换 WARP IP，并重新准备验证码页面。"""
     print("  [INFO] 服务器拒绝 captcha，立即切换 WARP IP...")
-    if not restart_warp(proxy):
-        print("  [ERROR] WARP IP 切换失败，停止本次 captcha 重试")
-        return False
+    restart_warp()
     if not handoff_browser_to_warp(browser):
         print("  [ERROR] WARP 直连浏览器重建失败，停止本次 captcha 重试")
         return False
@@ -3022,6 +3038,7 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
         - 内层 CaptchaBlocked 时重启 WARP 换 IP，最多 MAX_WARP_RETRIES 次
         - 任一环节出现 CaptchaBlocked 异常，立即重启 WARP 换 IP
         - 任一环节出现其他异常，重试当前 URL（不换 IP）
+        - WARP 未就绪或严格换出口失败时记录固定原因并停止本次续期
         - 任一次成功立即返回 result，不再继续重试
 
     Args:
@@ -3117,9 +3134,10 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
             # 4. 最终续期页面强制脱离 sing-box，改由系统 WARP 直连。
             # 入口点击可通过代理完成，但验证码和最后提交必须使用同一 WARP 出口。
             print("  [INFO] 已进入最终续期页面，切换为 WARP 直连浏览器...")
-            if not restart_warp(proxy):
-                result["public_reason"] = "warp_failed"
-                raise CaptchaBlocked("最终续期页面 WARP 切换失败")
+            if renew_attempt == 1:
+                ensure_warp_ready()
+            else:
+                restart_warp()
             if not handoff_browser_to_warp(browser, HAX_VPS_RENEW_CODE_URL):
                 result["public_reason"] = "warp_failed"
                 raise CaptchaBlocked("最终续期页面 WARP 直连浏览器重建失败")
@@ -3179,8 +3197,12 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
                 continue
             break
 
+        except WarpError as e:
+            result["public_reason"] = e.reason
+            result["message"] = str(e)
+            break
         except CaptchaBlocked as e:
-            # reCAPTCHA 音频未下发、算术验证码无法识别等都说明当前出口不可用。
+            # 此处保留已有恢复调用；验证码失败类型与换出口条件由后续重试改造统一。
             # 算术验证码即使到达普通重试上限，也额外保留一次 WARP 重试。
             is_arithmetic_failure = isinstance(e, ArithmeticCaptchaUnavailable)
             can_retry = renew_attempt < MAX_RENEW_RETRIES_PER_URL
@@ -3190,9 +3212,14 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
             if can_retry:
                 print(f"  [WARN] {type(e).__name__}: {e}")
                 print("  [INFO] 验证码失败，立即切换 WARP IP 后重试...")
-                if restart_warp(proxy) and handoff_browser_to_warp(browser):
-                    time.sleep(5)
-                    continue
+                try:
+                    if restart_warp() and handoff_browser_to_warp(browser):
+                        time.sleep(5)
+                        continue
+                except WarpError as warp_error:
+                    result["public_reason"] = warp_error.reason
+                    result["message"] = str(warp_error)
+                    break
             if result.get("public_reason") != "warp_failed":
                 result["public_reason"] = "captcha_failed"
             result["message"] = f"验证码失败: {e}"
@@ -3324,22 +3351,53 @@ def check_ip(proxy: str = None) -> str:
     return f"未知 IP [{mode}]"
 
 
-def restart_warp(proxy: str = None):
-    """重启 WARP 以更换出口 IP（参考 demo/main.py）"""
-    return get_warp_manager().rotate_ip(proxy=proxy,
-                                        max_attempts=MAX_WARP_ROTATE_ATTEMPTS)
+def ensure_warp_ready() -> None:
+    """首次准备只要求 WARP 可用，允许复用已有的有效出口。"""
+    manager = get_warp_manager()
+    if not manager.ensure_ready(max_attempts=MAX_WARP_ROTATE_ATTEMPTS):
+        raise WarpError(manager.failure_reason)
+
+
+def restart_warp() -> bool:
+    """失败恢复必须取得新出口，未取得时停止当前续期。"""
+    manager = get_warp_manager()
+    if not manager.rotate_ip(max_attempts=MAX_WARP_ROTATE_ATTEMPTS):
+        raise WarpError(manager.failure_reason)
+    return True
 
 
 class WarpManager:
     """
     系统级 WARP VPN IP 轮换。
-    _used_ips 记录本次运行已用过的 IP，重复时自动重试。
+    _used_ips 记录本次运行已用过的直连 IPv4，不代表这些 IP 已被网站封锁。
+    首次准备允许复用；明确要求换出口时，重复的 IP 不能算作新出口。
     """
+
     def __init__(self):
         self._used_ips: set = set()
         self.rotation_count: int = 0
         self.warp_refresh_count: int = 0
         self.current_tag: str = ""
+        self.failure_reason: str = "none"
+
+    def ensure_ready(self, max_attempts: int = 8) -> bool:
+        """核实 WARP 连接；已可用时不重新注册，也不增加换 IP 次数。"""
+        self.failure_reason = "none"
+        if self._wait_connected(max_wait=0):
+            current_ip = self._get_current_ip()
+            if current_ip:
+                self._used_ips.add(current_ip)
+                return True
+            self.failure_reason = "warp_ip_query_failed"
+            return False
+        self.failure_reason = "warp_connection_failed"
+        for _attempt in range(max_attempts):
+            current_ip = self._do_one_rotate()
+            if current_ip:
+                self._used_ips.add(current_ip)
+                self.failure_reason = "none"
+                return True
+        return False
 
     def _run(self, args: list, timeout: int = None) -> subprocess.CompletedProcess:
         if timeout is None:
@@ -3371,107 +3429,141 @@ class WarpManager:
             print(f"  [WARP] stderr: {result.stderr.strip()}")
         return result
 
-    def _get_current_ip(self, proxy: str = None) -> str:
-        # 优先通过 SOCKS5 代理查询，得到的是浏览器实际出口 IP（hax.co.id 看到的 IP），
-        # 而不是系统 WARP IP。否则记录的初始 IP 与去重池都会用错。
-        if proxy is not None:
-            try:
-                proxies = {"http": proxy, "https": proxy}
-                r = requests.get("https://api.ipify.org", proxies=proxies, timeout=20)
-                return r.text.strip()
-            except Exception:
-                pass
+    def _get_current_ip(self) -> str:
+        # 换出口前后均查询系统直连 IPv4，不混用浏览器代理出口。
         try:
             r = subprocess.run(
-                ["curl", "-s", "--max-time", "15", "https://api.ipify.org"],
-                capture_output=True, text=True, timeout=20
+                [
+                    "curl",
+                    "-4",
+                    "-fsS",
+                    "--noproxy",
+                    "*",
+                    "--max-time",
+                    "15",
+                    "https://api.ipify.org",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
             )
-            return r.stdout.strip()
+            if r.returncode == 0:
+                return str(IPv4Address(r.stdout.strip()))
         except Exception:
-            return ""
+            pass
+        return ""
 
     def _wait_connected(self, max_wait: int = 60) -> bool:
         print(f"  [WARP] 等待 VPN 连接就绪（最多 {max_wait}s）...")
-        start = time.time()
-        while time.time() - start < max_wait:
+        deadline = time.monotonic() + max_wait
+        while True:
             try:
                 r = subprocess.run(
-                    ["curl", "-s", "--max-time", "10",
-                     "https://www.cloudflare.com/cdn-cgi/trace"],
-                    capture_output=True, text=True, timeout=15
+                    [
+                        "curl",
+                        "-4",
+                        "-fsS",
+                        "--noproxy",
+                        "*",
+                        "--max-time",
+                        "10",
+                        "https://www.cloudflare.com/cdn-cgi/trace",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
                 )
-                trace = r.stdout
-                if "warp=on" in trace or "warp=plus" in trace:
-                    ip_lines = [l for l in trace.splitlines() if l.startswith("ip=")]
-                    ip = ip_lines[0].split("=")[1] if ip_lines else "unknown"
-                    print(f"  [WARP] ✅ VPN 就绪，出口 IP: {ip}")
+                trace = dict(
+                    line.split("=", 1) for line in r.stdout.splitlines() if "=" in line
+                )
+                if r.returncode == 0 and trace.get("warp") in {"on", "plus"}:
+                    IPv4Address(trace.get("ip", ""))
+                    print("  [WARP] ✅ 已核实 WARP IPv4 连接")
                     return True
             except Exception as e:
                 print(f"  [WARP] 等待中... ({e})")
-            time.sleep(3)
-        print("  [WARP] ❌ 等待超时，warp 未激活")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
+        print("  [WARP] ❌ 未能核实 WARP 连接")
         return False
 
-    def _do_one_rotate(self, proxy: str = None) -> str:
+    def _do_one_rotate(self) -> str:
         self.warp_refresh_count += 1
         print(f"  [WARP] [{self.current_tag}] warp刷新第 {self.warp_refresh_count} 次")
-        self._run(["disconnect"])
-        time.sleep(2)
-        self._run(["registration", "delete"])
-        time.sleep(2)
-        result = self._run(["registration", "new"])
+        self.failure_reason = "warp_connection_failed"
+        try:
+            self._run(["disconnect"])
+            time.sleep(2)
+            self._run(["registration", "delete"])
+            time.sleep(2)
+            result = self._run(["registration", "new"])
+        except OSError:
+            return ""
         if result.returncode != 0:
+            self.failure_reason = "warp_registration_failed"
             print("  [WARP] ❌ 注册失败")
             return ""
         time.sleep(3)
-        self._run(["connect"])
+        try:
+            if self._run(["connect"]).returncode != 0:
+                return ""
+        except OSError:
+            return ""
         time.sleep(5)
         if not self._wait_connected(max_wait=60):
             print("  [WARP] ❌ WARP 连接失败")
             return ""
-        return self._get_current_ip(None)  # 直连查询，得到真实 WARP 出口
+        current_ip = self._get_current_ip()
+        self.failure_reason = "none" if current_ip else "warp_ip_query_failed"
+        return current_ip
 
-    def rotate_ip(self, attempt_idx: int = 0, max_attempts: int = 8, proxy: str = None) -> bool:
+    def rotate_ip(self, attempt_idx: int = 0, max_attempts: int = 8) -> bool:
         print(f"  [WARP] ========== 第 {attempt_idx + 1} 次 IP 轮换 ==========")
         print(f"  [WARP] 已用 IP 池: {self._used_ips if self._used_ips else '(空)'}")
 
-        old_ip = self._get_current_ip(proxy)
-        print(f"  [WARP] 旧 IP(代理出口): {old_ip}")
+        self.failure_reason = "none"
+        old_ip = self._get_current_ip()
+        if not old_ip:
+            self.failure_reason = "warp_ip_query_failed"
+            return False
+        print(f"  [WARP] 旧 WARP 出口: {old_ip}")
+        self.failure_reason = "warp_new_exit_unavailable"
 
         for i in range(1, max_attempts + 1):
             print(f"  [WARP] 轮换尝试 {i}/{max_attempts}")
-            new_ip = self._do_one_rotate(proxy=None)  # 不传 proxy，查询真实 WARP 出口
+            new_ip = self._do_one_rotate()
 
             if not new_ip:
                 print(f"  [WARP] ⚠️  第 {i} 次轮换失败，继续重试")
-            elif new_ip in self._used_ips:
+            elif new_ip == old_ip or new_ip in self._used_ips:
+                self.failure_reason = "warp_new_exit_unavailable"
                 print(f"  [WARP] ♻️  IP {new_ip} 已被本次运行使用过，继续尝试...")
             else:
                 self._used_ips.add(new_ip)
                 self.rotation_count += 1
-                print(f"  [WARP] [{self.current_tag}] 不重复新IP第 {self.rotation_count} 个: {new_ip}")
-                if new_ip != old_ip:
-                    print(f"  [WARP] ✅ IP 已变化: {old_ip} → {new_ip}")
-                else:
-                    print(f"  [WARP] ⚠️  IP 与旧 IP 相同（{new_ip}），但未被本轮其他请求使用，接受")
+                self.failure_reason = "none"
+                print(
+                    f"  [WARP] [{self.current_tag}] 不重复新IP第 {self.rotation_count} 个: {new_ip}"
+                )
+                print(f"  [WARP] ✅ IP 已变化: {old_ip} → {new_ip}")
                 print(f"  [WARP] 已用 IP 池: {self._used_ips}")
                 return True
 
-            # 拿不到新 IP 不能放弃（带着被封 IP 去解验证码必失败），
-            # 递增间隔再试：立即重注册 Cloudflare 往往返回同一 colo 的同一出口。
+            # 此调用明确要求新出口；立即重注册仍可能返回相同出口，按原间隔有限重试。
             if i < max_attempts:
                 delay = min(5 * i, 20)
                 print(f"  [WARP] 等待 {delay}s 后再次轮换...")
                 time.sleep(delay)
 
-        print(f"  [WARP] ❌ {max_attempts} 次尝试均未获得新 IP，当前出口: {self._get_current_ip()}")
+        print(f"  [WARP] ❌ {max_attempts} 次尝试结束，未取得可继续使用的新出口")
         return False
 
-    def record_initial_ip(self, proxy: str = None):
-        ip = self._get_current_ip(proxy)
+    def record_initial_ip(self):
+        ip = self._get_current_ip()
         if ip:
             self._used_ips.add(ip)
-            print(f"  [WARP] 记录初始 IP(代理出口): {ip}，已用 IP 池: {self._used_ips}")
+            print(f"  [WARP] 记录初始 WARP 出口: {ip}，已用 IP 池: {self._used_ips}")
 
 
 _warp_manager: WarpManager = None
@@ -3684,7 +3776,7 @@ def main():
             co.set_argument('--proxy-bypass-list', '<-loopback>')
             print('[INFO] 使用 Chromium 原生 SOCKS5 代理')
         page=ChromiumPage(co); page.set.timeouts(page_load=30,script=30); block_ad_domains(page); browser=DPBrowser(page)
-        get_warp_manager().record_initial_ip(proxy)
+        get_warp_manager().record_initial_ip()
         for i, acc in enumerate(accounts, 1):
             # 每个账号可独立设置 TG 凭据，未设置则沿用全局
             if acc.get("tg_api_id"):

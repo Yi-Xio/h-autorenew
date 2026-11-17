@@ -104,6 +104,25 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(content.count("### "), 1)
         self.assertLess(len(content.encode()), 16384)
 
+    def test_warp_failures_have_specific_reason_and_location(self) -> None:
+        for reason, label, stage in (
+            ("warp_registration_failed", "WARP 注册失败", "注册 WARP"),
+            ("warp_connection_failed", "未能核实 WARP 连接", "核实 WARP 连接"),
+            ("warp_ip_query_failed", "未取得有效的 WARP 出口 IP", "查询 WARP 出口"),
+            ("warp_new_exit_unavailable", "未取得新的 WARP 出口", "更换 WARP 出口"),
+        ):
+            counts = dict.fromkeys(COUNTERS, 0)
+            counts["failed"] = 1
+            self.runtime(
+                result="failed",
+                reason=reason,
+                summary=counts,
+                details=dict(empty_details(), reason=reason),
+            )
+            content = self.invoke()
+            self.assertIn(label, content)
+            self.assertIn("| 失败或待核实位置 | " + stage + " |", content)
+
     def test_notification_failure_does_not_rewrite_verified_renewal(self) -> None:
         details = {**empty_details(), "text_failed": 1, "photo_sent": 1}
         self.runtime(details=details)

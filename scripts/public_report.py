@@ -31,7 +31,16 @@ DETAIL_COUNTERS = (
     "photo_sent",
     "photo_failed",
 )
-REASONS = frozenset(
+WARP_FAILURE_REASONS = frozenset(
+    {
+        "warp_failed",
+        "warp_registration_failed",
+        "warp_connection_failed",
+        "warp_ip_query_failed",
+        "warp_new_exit_unavailable",
+    }
+)
+REASONS = WARP_FAILURE_REASONS | frozenset(
     {
         "none",
         "login_failed",
@@ -40,7 +49,6 @@ REASONS = frozenset(
         "renewal_unverified",
         "captcha_failed",
         "renewal_code_unavailable",
-        "warp_failed",
     }
 )
 _details: Dict[str, Any] = {**dict.fromkeys(DETAIL_COUNTERS, 0), "reason": "none"}
