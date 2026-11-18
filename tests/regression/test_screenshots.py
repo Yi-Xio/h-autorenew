@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any, Dict
 
 from scripts.public_report import publish_progress, renewal_verified, screenshot_allowed
-from tests.test_runtime import PROJECT
+from tests.regression.fixtures import PROJECT
 
 
 class FakeBrowser:

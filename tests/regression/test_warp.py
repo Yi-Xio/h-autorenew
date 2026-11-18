@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 from scripts.job_summary import REASON_LABELS
 from scripts.public_report import WARP_FAILURE_REASONS
+from scripts.web_sessions import AuthenticationError
 
 PROJECT = Path(__file__).resolve().parents[2]
 CLI_SOURCE = r"""
@@ -97,6 +98,7 @@ def warp_functions(clock: Clock) -> dict[str, Any]:
         WARP_CMD_TIMEOUT=2,
         WARP_FAILURE_REASONS=WARP_FAILURE_REASONS,
         REASON_LABELS=REASON_LABELS,
+        AuthenticationError=AuthenticationError,
         MAX_WARP_ROTATE_ATTEMPTS=2,
         Dict=Dict,
         Any=Any,
@@ -241,6 +243,7 @@ class WarpTests(unittest.TestCase):
         browser = SimpleNamespace(
             get_page_source=lambda: "<form></form>",
             get_title=lambda: "Renew",
+            telegram_reader=SimpleNamespace(arm=lambda: None),
         )
         namespace.update(
             _parse_iso_date=lambda text: None,
@@ -251,7 +254,6 @@ class WarpTests(unittest.TestCase):
             MAX_WARP_RETRIES=1,
             HAX_VPS_RENEW_CODE_URL="https://hax.co.id/vps-renew-code",
             _renew_fill_form=lambda *args: None,
-            _renew_start_tg_listener=lambda *args, **kwargs: ({}, None),
             _renew_navigate_to_code_page=lambda *args: None,
             handoff_browser_to_warp=lambda *args: True,
             dismiss_cookie_only=lambda *args: None,

@@ -5,7 +5,63 @@ import hmac
 import os
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Dict, List
+
+from scripts.renewal_config import (
+    WebAccount,
+    account_masks,
+    cache_identity,
+    notification_config,
+    select_account,
+)
+
+
+@dataclass
+class Account:
+    """正式入口选择后的单账号配置，不持有账号数组。"""
+
+    index: int
+    phone: str
+    token: str
+    chat: str
+    identifier: str
+    stable_id: str = ""
+    web: WebAccount | None = None
+    legacy: List[str] | None = None
+
+    def masks(self) -> List[str]:
+        """返回需要补充遮罩的当前账号字段。"""
+        return (account_masks(self.web) if self.web else self.legacy or []) + [
+            self.token,
+            self.chat,
+        ]
+
+
+def runtime_account(
+    platform: str, environ: Dict[str, str], with_notification: bool = True
+) -> Account:
+    """Hax 只用新数组，Woiden 保持已有六字段配置。"""
+    if platform == "hax":
+        index, web = select_account(environ)
+        token, chat = notification_config(environ) if with_notification else ("", "")
+        raw = environ.get("BATCH_ACCOUNT_INDEX", str(index))
+        if not re.fullmatch(r"[1-9][0-9]{0,2}", raw) or int(raw) > 256:
+            raise ValueError("invalid_account_index")
+        return Account(
+            int(raw), web["phone"], token, chat, cache_identity(web), web["id"], web
+        )
+    if platform != "woiden":
+        raise ValueError("invalid_platform")
+    index, fields = selected_account(environ)
+    return Account(
+        index,
+        fields[0],
+        fields[1],
+        fields[2],
+        public_account_id(platform, fields),
+        legacy=fields,
+    )
 
 
 def parse_batch(value: str) -> List[List[str]]:
@@ -46,8 +102,12 @@ def state_key(phone: str) -> str:
     return hashlib.md5(phone.strip().encode()).hexdigest()[:8]
 
 
-def public_account_id(platform: str, fields: Sequence[str]) -> str:
-    """用 Session 作为 HMAC 密钥生成公开标识，账号重排不改变归属。"""
+def public_account_id(platform: str, fields: Sequence[str] | Account) -> str:
+    """从当前认证材料生成公开标识，账号重排不改变归属。"""
+    if platform not in {"hax", "woiden"}:
+        raise ValueError("invalid_account")
+    if isinstance(fields, Account):
+        return fields.identifier
     if platform not in {"hax", "woiden"} or len(fields) != 6 or not all(fields):
         raise ValueError("invalid_account")
     message = f"renewal-state:v1:{platform}:{fields[0]}".encode()

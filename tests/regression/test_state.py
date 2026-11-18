@@ -7,7 +7,7 @@ from pathlib import Path
 
 from scripts.accounts import public_account_id, state_key
 from scripts.state import prepare_cached_state, read_cached_state
-from tests.test_runtime import ACCOUNT, SECOND
+from tests.regression.fixtures import ACCOUNT, SECOND
 
 
 class StateTests(unittest.TestCase):

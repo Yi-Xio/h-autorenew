@@ -31,6 +31,101 @@ DETAIL_COUNTERS = (
     "photo_sent",
     "photo_failed",
 )
+NAVIGATION_FLAGS = (
+    "expected_origin",
+    "path_match",
+    "logout_link",
+    "login_page",
+    "code_input",
+    "submit_button",
+    "info_heading",
+    "rules_ready",
+    "dom_ready",
+    "adblock",
+    "challenge",
+)
+NAVIGATION_ENUMS = {
+    "status": {
+        "ready",
+        "loading",
+        "unknown",
+        "challenge",
+        "login_required",
+        "adblock",
+        "unavailable",
+    },
+    "document_state": {"loading", "interactive", "complete", "unavailable"},
+    "current_route": {"home", "info", "renew_code", "login", "other"},
+    "expected_route": {"home", "info", "renew_code"},
+}
+CHECK_RESULTS = {
+    "authentication": {
+        "site_widget": {"waiting", "ready", "missing", "invalid", "challenge"},
+        "oauth_widget": {"waiting", "ready", "missing", "invalid"},
+        "authorization": {
+            "reading",
+            "ready",
+            "unavailable",
+            "required",
+            "invalid",
+            "mismatch",
+        },
+        "callback": {"sent", "ready", "invalid", "unavailable", "challenge"},
+        "telegram_web": {
+            "ready",
+            "client_loading",
+            "peer_loading",
+            "login_required",
+            "wrong_account",
+            "unavailable",
+            "origin_invalid",
+        },
+    },
+    "captcha": {
+        "turnstile": {"passed", "token_missing"},
+        "recaptcha": {
+            "passed",
+            "dependency_missing",
+            "anchor_missing",
+            "anchor_loading",
+            "frame_unavailable",
+            "inspection_failed",
+            "blocked",
+            "audio_error",
+        },
+        "audio_challenge": {
+            "frame_missing",
+            "button_missing",
+            "input_missing",
+            "interaction_failed",
+        },
+        "audio_source": {"frame_missing", "url_missing", "read_failed"},
+        "audio_download": {
+            "url_missing",
+            "http_failed",
+            "network_failed",
+            "connect_timeout",
+            "read_timeout",
+            "tls_failed",
+            "proxy_failed",
+            "connection_failed",
+            "invalid_response",
+            "write_failed",
+        },
+        "audio_decode": {"failed", "invalid_wav", "timeout"},
+        "audio_recognition": {"unrecognized", "service_failed", "empty", "failed"},
+        "audio_verify": {"controls_missing", "interaction_failed", "not_solved"},
+        "arithmetic": {
+            "expression_missing",
+            "operands_unavailable",
+            "unsupported_operation",
+            "input_missing",
+            "input_failed",
+            "passed",
+        },
+        "site_feedback": {"rejected"},
+    },
+}
 WARP_FAILURE_REASONS = frozenset(
     {
         "warp_failed",
@@ -49,6 +144,20 @@ REASONS = WARP_FAILURE_REASONS | frozenset(
         "renewal_unverified",
         "captcha_failed",
         "renewal_code_unavailable",
+        "telegram_session_invalid",
+        "hax_session_invalid",
+        "hax_page_unverified",
+        "access_blocked",
+        "network_failed",
+        "telegram_peer_unverified",
+        "renewal_code_ambiguous",
+        "browser_unavailable",
+        "hax_authorization_required",
+        "hax_account_mismatch",
+        "hax_widget_unverified",
+        "hax_callback_unverified",
+        "hax_rules_unavailable",
+        "adblock_detected",
     }
 )
 _details: Dict[str, Any] = {**dict.fromkeys(DETAIL_COUNTERS, 0), "reason": "none"}
@@ -101,20 +210,104 @@ def publish_progress(stage: str) -> None:
     if stage not in STAGES or stage == "complete":
         raise ValueError("invalid_stage")
     if stage == "preparing":
+        _details.pop("navigation", None)
+        _details.pop("checks", None)
         _details.update({**dict.fromkeys(DETAIL_COUNTERS, 0), "reason": "none"})
     _write_snapshot(stage, None)
 
 
 def validate_details(value: object) -> Dict[str, Any]:
     """明细只有固定原因和有界计数，不接收页面或异常原文。"""
-    if not isinstance(value, dict) or set(value) != {*DETAIL_COUNTERS, "reason"}:
+    required = {*DETAIL_COUNTERS, "reason"}
+    if (
+        not isinstance(value, dict)
+        or not required <= set(value)
+        or set(value) - required - {"navigation", "checks"}
+    ):
         raise ValueError("invalid_details")
     if not isinstance(value["reason"], str) or value["reason"] not in REASONS:
         raise ValueError("invalid_details")
     for key in DETAIL_COUNTERS:
         if type(value[key]) is not int or not 0 <= value[key] <= MAX_COUNTER:
             raise ValueError("invalid_details")
+    if "navigation" in value:
+        samples = value["navigation"]
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 6:
+            raise ValueError("invalid_navigation")
+        for sample in samples:
+            validate_navigation(sample)
+    if "checks" in value:
+        checks = value["checks"]
+        if (
+            not isinstance(checks, dict)
+            or not checks
+            or set(checks) - set(CHECK_RESULTS)
+        ):
+            raise ValueError("invalid_checks")
+        for name, check in checks.items():
+            if not isinstance(check, dict) or set(check) != {"step", "result"}:
+                raise ValueError("invalid_checks")
+            step, result = check["step"], check["result"]
+            if (
+                not isinstance(step, str)
+                or not isinstance(result, str)
+                or result not in CHECK_RESULTS[name].get(step, set())
+            ):
+                raise ValueError("invalid_checks")
     return dict(value)
+
+
+def validate_navigation(value: object) -> Dict[str, Any]:
+    """页面检查只接受固定分类、布尔值和有界耗时。"""
+    if not isinstance(value, dict) or set(value) != {
+        *NAVIGATION_FLAGS,
+        *NAVIGATION_ENUMS,
+        "elapsed_seconds",
+    }:
+        raise ValueError("invalid_navigation")
+    for name in NAVIGATION_FLAGS:
+        if type(value[name]) is not bool:
+            raise ValueError("invalid_navigation")
+    for name, allowed in NAVIGATION_ENUMS.items():
+        if not isinstance(value[name], str) or value[name] not in allowed:
+            raise ValueError("invalid_navigation")
+    if (
+        type(value["elapsed_seconds"]) is not int
+        or not 0 <= value["elapsed_seconds"] <= MAX_COUNTER
+    ):
+        raise ValueError("invalid_navigation")
+    return dict(value)
+
+
+def record_navigation(value: object) -> None:
+    """在现有报告中保留最近六次页面条件，不写入页面原文。"""
+    sample = validate_navigation(value)
+    _details["navigation"] = [*_details.get("navigation", []), sample][-6:]
+    _write_snapshot(_stage, None)
+
+
+def record_check(name: str, step: str, result: str) -> None:
+    """记录认证或验证码的最后检查结果，不接收页面、答案或异常原文。"""
+    checks = {**_details.get("checks", {}), name: dict(step=step, result=result)}
+    validate_details({**_details, "checks": checks})
+    _details["checks"] = checks
+    _write_snapshot(_stage, None)
+
+
+def authentication_result(status: str, reason: str) -> Dict[str, Any]:
+    """保留本轮认证检查，不把通知计数或业务结果混入只读报告。"""
+    if status not in {"valid", "failed"} or reason not in REASONS:
+        raise ValueError("invalid_auth_report")
+    if (status == "valid") != (reason == "none"):
+        raise ValueError("invalid_auth_report")
+    details = validate_details(_details)
+    check = details.get("checks", {}).get("authentication")
+    return dict(
+        version=1,
+        status=status,
+        reason=reason,
+        checks={"authentication": dict(check)} if check else {},
+    )
 
 
 def record_notification(kind: str, sent: bool) -> None:
@@ -163,7 +356,12 @@ def validate_snapshot(value: object) -> tuple[str, Dict[str, int] | None]:
 
 # 上游结果字典包含页面信息等不同类型，只在此处提取允许公开的计数。
 def renewal_verified(server: Mapping[str, Any]) -> bool:
-    """只以信息页中实际向后延长的日期确认续期。"""
+    """Hax 以本轮真实反馈确认；未迁移的旧业务保留日期核实。"""
+    if "feedback_status" in server:
+        return (
+            server["feedback_status"] == "success"
+            and server.get("submission_attempted") is True
+        )
     old = iso_date(server.get("old_valid_until"))
     observed = iso_date(server.get("info_valid_until"))
     return bool(old and observed and observed > old)
@@ -198,7 +396,10 @@ def publish_results(results: Sequence[Mapping[str, Any]], platform: str) -> int:
                 summary["skipped"] += 1
             elif renewal_verified(server):
                 summary["renewed"] += 1
-            elif server.get("success") is True:
+            elif server.get("success") is True or (
+                server.get("submission_attempted") is True
+                and server.get("feedback_status") == "unknown"
+            ):
                 summary["unverified"] += 1
                 _details["reason"] = "renewal_unverified"
             else:

@@ -11,7 +11,8 @@ from pathlib import Path
 
 from scripts.job_summary import RUNTIME_FILE, empty_details, save_runtime
 from scripts.public_report import COUNTERS
-from tests.test_runtime import ACCOUNT, PROJECT, environment
+from tests.regression.fixtures import ACCOUNT, PROJECT, environment
+from tests.regression.fixtures import web_environment
 
 
 class SummaryTests(unittest.TestCase):
@@ -91,8 +92,8 @@ class SummaryTests(unittest.TestCase):
         content = self.invoke()
         for value in (
             "Hax · 账号 #1",
-            "已验证延长",
-            "已延长 1 台",
+            "续期成功",
+            "续期成功 1 台",
             "已发送 1 条",
             "未生成可发送截图",
             "已保存（已确认本轮缓存存在）",
@@ -127,7 +128,7 @@ class SummaryTests(unittest.TestCase):
         details = {**empty_details(), "text_failed": 1, "photo_sent": 1}
         self.runtime(details=details)
         content = self.invoke()
-        self.assertIn("已验证延长", content)
+        self.assertIn("续期成功", content)
         self.assertIn("Telegram 文字 | 失败 1 条", content)
         self.assertIn("Telegram 截图 | 已发送 1 张", content)
         self.assertIn("通知未全部发送成功", content)
@@ -251,14 +252,14 @@ class SummaryTests(unittest.TestCase):
                 content = self.invoke()
                 self.assertIn(expected, content)
                 self.assertIn("登录网站", content)
-                self.assertNotIn("已验证延长", content)
+                self.assertNotIn("续期成功", content)
 
     def test_skipped_worker_does_not_reuse_a_previous_success_report(self) -> None:
         self.runtime()
         self.env.update(RENEW_OUTCOME="skipped", WARP_OUTCOME="failure")
         content = self.invoke()
         self.assertIn("WARP 连接失败", content)
-        self.assertNotIn("已验证延长", content)
+        self.assertNotIn("续期成功", content)
 
     def test_extra_fields_free_text_wrong_identity_and_bad_counts_are_not_rendered(
         self,
@@ -285,7 +286,7 @@ class SummaryTests(unittest.TestCase):
                 path.write_text(json.dumps(value))
                 content = self.invoke()
                 self.assertIn("运行报告未通过校验", content)
-                self.assertNotIn("已验证延长", content)
+                self.assertNotIn("续期成功", content)
         path.write_text("FAKE_MARKDOWN" * 2000)
         self.assertIn("运行报告未通过校验", self.invoke())
         path.unlink()
@@ -299,6 +300,7 @@ class SummaryTests(unittest.TestCase):
         self.invoke()
 
     def test_runtime_defers_summary_until_workflow_has_cache_results(self) -> None:
+        self.env.update(web_environment())
         self.env.update(
             BATCH=ACCOUNT,
             PUBLIC_SUMMARY_DEFERRED="1",
@@ -308,7 +310,8 @@ class SummaryTests(unittest.TestCase):
         (self.root / "hax-renew.py").write_text(
             "import os, sys\nfrom scripts.public_report import publish_results, record_notification\n"
             "record_notification('text', True)\n"
-            "sys.exit(publish_results([{'username': os.environ['BATCH'].split(',')[0], 'servers': "
+            "from scripts.renewal_config import worker_account\n"
+            "sys.exit(publish_results([{'username': worker_account(os.environ)['phone'], 'servers': "
             "[{'old_valid_until': '2026-11-01', 'info_valid_until': '2026-12-01', 'success': True}]}], 'hax'))\n"
         )
         result = subprocess.run(
@@ -328,7 +331,7 @@ class SummaryTests(unittest.TestCase):
             VERIFY_HIT="true",
         )
         content = self.invoke()
-        self.assertIn("已验证延长", content)
+        self.assertIn("续期成功", content)
         self.assertIn("已发送 1 条", content)
         self.assertIn("已保存（已确认本轮缓存存在）", content)
 

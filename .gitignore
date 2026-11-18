@@ -2,6 +2,9 @@
 .batch.env
 .phone_code_hash
 
+# 本地凭据、浏览器资料、测试状态和结果
+/.local/
+
 # Python
 __pycache__/
 *.pyc

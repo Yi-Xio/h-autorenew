@@ -14,14 +14,16 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import URLError
 
-from scripts.accounts import register_masks, state_key
+from scripts.accounts import register_masks, runtime_account, state_key
 from scripts.state import CACHE_FILE, prepare_cached_state
 from scripts.workflow import notify_skipped
-from tests.test_runtime import ACCOUNT, PROJECT, SECOND, environment
+from scripts.renewal_config import cache_identity
+from tests.regression.fixtures import ACCOUNT, PROJECT, SECOND, environment
+from tests.regression.fixtures import web_account, web_environment
 
 
 class WorkflowTests(unittest.TestCase):
-    """只注入假账号，缓存传输由临时文件模拟，不发送真实通知。"""
+    """只注入示例账号，缓存传输由临时文件模拟，不发送真实通知。"""
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="hax-test-workflow-")
@@ -37,6 +39,7 @@ class WorkflowTests(unittest.TestCase):
         self.env.update(
             {
                 "BATCH": ACCOUNT + ";" + SECOND,
+                **web_environment(2),
                 "BATCH_ACCOUNT_INDEX": "1",
                 "GITHUB_OUTPUT": str(self.root / "output.txt"),
                 "GITHUB_STEP_SUMMARY": str(self.root / "summary.md"),
@@ -71,7 +74,7 @@ class WorkflowTests(unittest.TestCase):
         )
 
     def assert_private(self, text: str) -> None:
-        """日志、输出和缓存中不能出现假凭据或原手机号索引。"""
+        """日志、输出和缓存中不能出现示例凭据或原手机号索引。"""
         for secret in (ACCOUNT + "," + SECOND).split(","):
             self.assertNotIn(secret, text)
         for account in (ACCOUNT, SECOND):
@@ -82,13 +85,58 @@ class WorkflowTests(unittest.TestCase):
         """生成经过校验的测试快照，随后由正式 CLI 恢复使用。"""
         observed = self.root / "fixture.txt"
         observed.write_text(f"{state_key(account.split(',')[0])},{state}\n")
-        prepare_cached_state(self.cache, observed, platform, account.split(","))
+        fields = (
+            account.split(",")
+            if platform == "woiden"
+            else runtime_account(
+                platform,
+                {
+                    **self.env,
+                    "RENEWAL_ACCOUNT_ID": "A002" if account == SECOND else "A001",
+                },
+            )
+        )
+        prepare_cached_state(self.cache, observed, platform, fields)
         observed.unlink()
 
-    def test_matrix_only_emits_numeric_indexes(self) -> None:
+    def test_matrix_only_emits_anonymous_ids_and_numeric_indexes(self) -> None:
         result = self.invoke("matrix")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(self.outputs()["matrix"]), {"index": [1, 2]})
+        self.assertEqual(
+            json.loads(self.outputs()["matrix"]),
+            {
+                "include": [
+                    {"index": 1, "key": cache_identity(web_account())},
+                    {"index": 2, "key": cache_identity(web_account(2))},
+                ]
+            },
+        )
+
+    def test_matrix_keeps_arbitrary_identifiers_private_and_keys_select_after_reorder(
+        self,
+    ) -> None:
+        first, second = web_account(), web_account(2)
+        first["id"] = " 美国 / 主机\n::error::example\x00"
+        second["id"] = "hax.co.id.us"
+        self.env["RENEWAL_ACCOUNTS"] = json.dumps(
+            dict(version=1, accounts=[first, second])
+        )
+        result = self.invoke("matrix")
+        self.assertEqual(result.returncode, 0)
+        raw = self.outputs()["matrix"]
+        entries = json.loads(raw)["include"]
+        for item in (first, second):
+            self.assertNotIn(item["id"], raw + result.stdout + result.stderr)
+        self.env.pop("RENEWAL_ACCOUNT_ID")
+        self.env["RENEWAL_ACCOUNT_KEY"] = entries[0]["key"]
+        self.assertEqual(self.invoke("setup-cache").returncode, 0)
+        previous = self.outputs()["cache_prefix"]
+        self.env["RENEWAL_ACCOUNTS"] = json.dumps(
+            dict(version=1, accounts=[second, first])
+        )
+        self.env["BATCH_ACCOUNT_INDEX"] = "2"
+        self.assertEqual(self.invoke("setup-cache").returncode, 0)
+        self.assertEqual(self.outputs()["cache_prefix"], previous)
 
     def test_cache_miss_ignores_upstream_repository_records(self) -> None:
         (self.root / "hax-time.txt").write_text(
@@ -98,6 +146,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["should_run"], "true")
         self.assertEqual(self.outputs()["cache_status"], "miss")
+
+    def test_single_character_identifier_does_not_mask_public_matrix(self) -> None:
+        account = web_account()
+        account["id"] = "a"
+        env = dict(
+            self.env,
+            RENEWAL_ACCOUNTS=json.dumps(dict(version=1, accounts=[account])),
+            GITHUB_ACTIONS="true",
+            GITHUB_REF="refs/heads/master",
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.workflow", "matrix", "hax"],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("::add-mask::a", result.stdout.splitlines())
+        entry = json.loads(self.outputs()["matrix"])["include"][0]
+        self.assertEqual(entry["key"], cache_identity(account))
+        self.assertNotIn("id", entry)
 
     def test_precheck_uses_platform_threshold_and_valid_prefix_restore(self) -> None:
         today = datetime.now(timezone(timedelta(hours=8))).date()
@@ -148,6 +219,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.cache.exists())
         self.assertFalse(self.cache.with_suffix(".tmp").exists())
         self.env["BATCH"] = SECOND + ";" + ACCOUNT
+        self.env["RENEWAL_ACCOUNTS"] = json.dumps(
+            dict(version=1, accounts=[web_account(2), web_account(1)])
+        )
         self.env["BATCH_ACCOUNT_INDEX"] = "2"
         self.env["GITHUB_RUN_ATTEMPT"] = "2"
         self.assertEqual(self.invoke("setup-cache").returncode, 0)
@@ -155,16 +229,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(first["cache_prefix"], second["cache_prefix"])
         self.assertNotEqual(first["cache_key"], second["cache_key"])
         self.env["BATCH_ACCOUNT_INDEX"] = "1"
+        self.env["RENEWAL_ACCOUNT_ID"] = "A002"
         self.assertEqual(self.invoke("setup-cache").returncode, 0)
         self.assertNotEqual(first["cache_prefix"], self.outputs()["cache_prefix"])
 
     def test_missing_batch_and_non_runtime_branches_fail_without_publishing_secrets(
         self,
     ) -> None:
-        self.env["BATCH"] = ""
+        self.env["RENEWAL_ACCOUNTS"] = ""
         self.assertNotEqual(self.invoke("matrix").returncode, 0)
         self.assertFalse((self.root / "output.txt").exists())
-        self.env["BATCH"] = ACCOUNT
+        self.env.update(web_environment())
         self.env["GITHUB_ACTIONS"] = "true"
         for ref in ("refs/heads/upstream", "refs/tags/master"):
             self.env["GITHUB_REF"] = ref
@@ -206,6 +281,7 @@ class WorkflowTests(unittest.TestCase):
                 os.environ,
                 {
                     "BATCH": ACCOUNT + ";" + SECOND,
+                    **web_environment(2),
                     "DAYS_LEFT": "6",
                     "GITHUB_ACTIONS": "false",
                 },
@@ -220,14 +296,20 @@ class WorkflowTests(unittest.TestCase):
             contextlib.redirect_stdout(output),
         ):
             for index in (1, 2):
-                with patch.dict(os.environ, {"BATCH_ACCOUNT_INDEX": str(index)}):
+                with patch.dict(
+                    os.environ,
+                    {
+                        "BATCH_ACCOUNT_INDEX": str(index),
+                        "RENEWAL_ACCOUNT_ID": f"A{index:03d}",
+                    },
+                ):
                     notify_skipped("hax")
         self.assertIn("account=1 stage=notification result=failed", output.getvalue())
         self.assertIn("account=2 stage=notification result=sent", output.getvalue())
         for call, account in zip(
             request.call_args_list, (ACCOUNT, SECOND), strict=True
         ):
-            fields = account.split(",")
+            fields = ACCOUNT.split(",")
             self.assertEqual(
                 call.args[0].full_url,
                 f"https://api.telegram.org/bot{fields[1]}/sendMessage",
@@ -242,6 +324,7 @@ class WorkflowTests(unittest.TestCase):
                 os.environ,
                 {
                     "BATCH": ACCOUNT,
+                    **web_environment(),
                     "BATCH_ACCOUNT_INDEX": "1",
                     "DAYS_LEFT": "6",
                     "GITHUB_ACTIONS": "false",
@@ -267,7 +350,7 @@ class WorkflowTests(unittest.TestCase):
         old = today.isoformat()
         future = (today + timedelta(days=7)).isoformat()
         worker = (
-            "import os, sys\nfrom scripts.public_report import publish_results\nfields = os.environ['BATCH'].split(',')\nassert len(fields) == 6\nsys.exit(publish_results([{'username': fields[0], 'servers': [{'old_valid_until': '"
+            "import os, sys\nfrom scripts.public_report import publish_results\nfrom scripts.renewal_config import worker_account\nphone = worker_account(os.environ)['phone'] if PLATFORM == 'hax' else os.environ['BATCH'].split(',')[0]\nsys.exit(publish_results([{'username': phone, 'servers': [{'old_valid_until': '"
             + old
             + "', 'info_valid_until': '"
             + future
@@ -284,11 +367,25 @@ class WorkflowTests(unittest.TestCase):
             self.env["BATCH"] = (
                 ACCOUNT + ";" + SECOND if cycle == 1 else SECOND + ";" + ACCOUNT
             )
+            self.env["RENEWAL_ACCOUNTS"] = json.dumps(
+                dict(
+                    version=1,
+                    accounts=[
+                        web_account(number)
+                        for number in ((1, 2) if cycle == 1 else (2, 1))
+                    ],
+                )
+            )
             self.assertEqual(self.invoke("matrix").returncode, 0)
-            indexes = json.loads(self.outputs()["matrix"])["index"]
+            indexes = [
+                item["index"]
+                for item in json.loads(self.outputs()["matrix"])["include"]
+            ]
             for platform in ("hax", "woiden"):
                 for index in indexes:
                     self.env["BATCH_ACCOUNT_INDEX"] = str(index)
+                    number = index if cycle == 1 else 3 - index
+                    self.env["RENEWAL_ACCOUNT_ID"] = f"A{number:03d}"
                     self.assertEqual(self.invoke("setup-cache", platform).returncode, 0)
                     keys = self.outputs()
                     prefix = keys["cache_prefix"]
@@ -350,7 +447,8 @@ class WorkflowTests(unittest.TestCase):
         (self.root / "hax-renew.py").write_text(
             "import os, sys\n"
             "from scripts.public_report import publish_results\n"
-            "phone = os.environ['BATCH'].split(',')[0]\n"
+            "from scripts.renewal_config import worker_account\n"
+            "phone = worker_account(os.environ)['phone']\n"
             f"sys.exit(publish_results([{{'username': phone, 'servers': [{{'old_valid_until': '{future}', 'skipped': True}}]}}], 'hax'))\n"
         )
         result = subprocess.run(
@@ -374,7 +472,8 @@ class WorkflowTests(unittest.TestCase):
         (self.root / "hax-renew.py").write_text(
             "import os, sys\n"
             "from scripts.public_report import publish_results\n"
-            "phone = os.environ['BATCH'].split(',')[0]\n"
+            "from scripts.renewal_config import worker_account\n"
+            "phone = worker_account(os.environ)['phone']\n"
             f"sys.exit(publish_results([{{'username': phone, 'servers': [{{'old_valid_until': '{old}', 'success': False}}]}}], 'hax'))\n"
         )
         result = subprocess.run(
@@ -390,6 +489,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.invoke("prepare-state").returncode, 0)
         self.assertEqual(self.outputs()["changed"], "true")
         self.assertEqual(json.loads(self.cache.read_text())["state"], old)
+
+    def test_authentication_failure_preserves_previous_expiry_cache(self) -> None:
+        """登录态失效不能被记录成无 VPS，也不能覆盖可靠旧日期。"""
+        old = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        self.cached(old)
+        previous = self.cache.read_bytes()
+        (self.root / "hax-renew.py").write_text(
+            "import os, sys\n"
+            "from scripts.public_report import publish_results\n"
+            "from scripts.renewal_config import worker_account\n"
+            "phone = worker_account(os.environ)['phone']\n"
+            "sys.exit(publish_results([{'username': phone, 'servers': [], 'public_reason': 'hax_session_invalid'}], 'hax'))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.actions_runtime", "hax"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed=1", result.stdout)
+        self.assertIn("no_vps=0", result.stdout)
+        self.assert_private(result.stdout + result.stderr)
+        self.assertEqual(self.invoke("prepare-state").returncode, 0)
+        self.assertEqual(self.outputs()["state_status"], "no_observed_state")
+        self.assertEqual(self.cache.read_bytes(), previous)
 
     def test_mask_registration_escapes_workflow_commands(self) -> None:
         output = io.StringIO()

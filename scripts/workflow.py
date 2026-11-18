@@ -13,15 +13,30 @@ from scripts.accounts import (
     parse_batch,
     public_account_id,
     register_masks,
-    selected_account,
+    runtime_account,
 )
+from scripts.renewal_config import account_masks, cache_identity, configured_accounts
 from scripts.public_report import iso_date
 from scripts.job_summary import render_summary, write_summary
 from scripts.state import CACHE_FILE, prepare_cached_state, read_cached_state
 
 
-def build_matrix() -> None:
-    """矩阵只传数字序号，完整凭据不进入任务名或步骤输出。"""
+def build_matrix(platform: str = "woiden") -> None:
+    """矩阵只传匿名标识和展示序号，凭据不进入任务名或步骤输出。"""
+    if platform == "hax":
+        accounts = configured_accounts(os.environ)
+        register_masks(
+            [field for account in accounts for field in account_masks(account)]
+        )
+        matrix = {
+            "include": [
+                {"index": index, "key": cache_identity(account)}
+                for index, account in enumerate(accounts, 1)
+            ]
+        }
+        _outputs({"matrix": json.dumps(matrix)})
+        print(f"stage=matrix accounts={len(accounts)}")
+        return
     accounts = parse_batch(os.environ.get("BATCH", ""))
     register_masks([field for account in accounts for field in account])
     _outputs({"matrix": json.dumps({"index": list(range(1, len(accounts) + 1))})})
@@ -30,8 +45,9 @@ def build_matrix() -> None:
 
 def setup_cache(platform: str) -> None:
     """清理本地旧快照，输出本账号专用的恢复前缀和新快照 key。"""
-    index, fields = selected_account(dict(os.environ))
-    register_masks(fields)
+    fields = runtime_account(platform, dict(os.environ), with_notification=False)
+    index = fields.index
+    register_masks(fields.masks())
     run = os.environ.get("GITHUB_RUN_ID", "1")
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
     if any(not re.fullmatch(r"[1-9][0-9]{0,24}", value) for value in (run, attempt)):
@@ -46,8 +62,9 @@ def setup_cache(platform: str) -> None:
 
 def check_account(platform: str) -> None:
     """按恢复的本账号日期预筛；缓存不可用时执行网站检查。"""
-    index, fields = selected_account(dict(os.environ))
-    register_masks(fields)
+    fields = runtime_account(platform, dict(os.environ), with_notification=False)
+    index = fields.index
+    register_masks(fields.masks())
     skip_days = int(os.environ.get("SKIP_DAYS", "5" if platform == "hax" else "2"))
     if not 1 <= skip_days <= 365:
         raise ValueError("invalid_threshold")
@@ -80,12 +97,13 @@ def check_account(platform: str) -> None:
 
 def notify_skipped(platform: str) -> None:
     """只通知本任务跳过的账号，公开端不打印请求错误。"""
-    index, fields = selected_account(dict(os.environ))
-    register_masks(fields)
+    fields = runtime_account(platform, dict(os.environ))
+    index = fields.index
+    register_masks(fields.masks())
     days = int(os.environ["DAYS_LEFT"])
     if not 0 <= days <= 4_000_000:
         raise ValueError("invalid_days")
-    phone, token, chat, *_ = fields
+    phone, token, chat = fields.phone, fields.token, fields.chat
     text = f"{platform} 续期报告\n账号: ***{phone[-3:]}\n剩余 {days} 天，无需续期"
     try:
         request = Request(
@@ -110,8 +128,9 @@ def notify_skipped(platform: str) -> None:
 
 def prepare_state(platform: str) -> None:
     """为官方保存 Action 准备快照；缺少可靠结果时不保存。"""
-    index, fields = selected_account(dict(os.environ))
-    register_masks(fields)
+    fields = runtime_account(platform, dict(os.environ), with_notification=False)
+    index = fields.index
+    register_masks(fields.masks())
     status = prepare_cached_state(
         CACHE_FILE,
         Path(f"{platform}-time-value.txt"),
@@ -143,7 +162,7 @@ def main() -> int:
             raise ValueError("invalid_branch")
         match sys.argv[1]:
             case "matrix":
-                build_matrix()
+                build_matrix(sys.argv[2])
             case "setup-cache":
                 setup_cache(sys.argv[2])
             case "check":

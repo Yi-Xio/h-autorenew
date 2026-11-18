@@ -1,0 +1,16 @@
+# 私有数据不能进入镜像构建上下文
+.local/
+.git/
+.venv/
+.ruff_cache/
+**/__pycache__/
+*.pyc
+output/
+screenshots/
+*.log
+.batch.env
+.phone_code_hash
+*-time-value.txt
+sing-box_config.json
+socks5_proxy.txt
+proxy_result.json

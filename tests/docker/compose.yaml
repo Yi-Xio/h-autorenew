@@ -1,0 +1,52 @@
+name: hax-local
+
+x-runtime: &runtime
+  image: ${COMPOSE_PROJECT_NAME}-runtime:authentication-v1
+  build:
+    context: ../..
+    dockerfile: tests/docker/Dockerfile
+  platform: linux/amd64
+  init: true
+  shm_size: 1gb
+  stop_grace_period: 20s
+  tmpfs:
+    # 回归会在临时目录生成命令替身，需要允许执行。
+    - /tmp:exec,mode=1777
+    - /run:mode=755
+    - /var/lib/cloudflare-warp:mode=700
+  environment: &host
+    HAX_DATA_UID: ${HAX_DATA_UID:?Use the test shell entrypoint}
+    HAX_DATA_GID: ${HAX_DATA_GID:?Use the test shell entrypoint}
+
+services:
+  regression:
+    <<: *runtime
+    command: [regression]
+    network_mode: none
+
+  prepare:
+    <<: *runtime
+    command: [prepare]
+    user: "${HAX_DATA_UID}:${HAX_DATA_GID}"
+    environment:
+      <<: *host
+      HAX_DESKTOP_PORT: ${HAX_DESKTOP_PORT:-6080}
+    stdin_open: true
+    tty: true
+    ports:
+      - "127.0.0.1:${HAX_DESKTOP_PORT:-6080}:6080"
+    volumes:
+      - ../../.local:/opt/hax/.local
+
+  live:
+    <<: *runtime
+    command: [live]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      <<: *host
+    volumes:
+      - ../../.local/secrets:/mnt/hax-secrets:ro
+      - ../../.local/state:/mnt/hax-state
+      - ../../.local/results:/mnt/hax-results

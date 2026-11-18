@@ -15,6 +15,7 @@ from scripts.public_report import (
 )
 
 RUNTIME_FILE = Path("output/renewal-result.json")
+AUTHENTICATION_FILE = Path("output/authentication-result.json")
 RUNTIME_REASONS = REASONS | {
     "timeout",
     "cancelled",
@@ -34,7 +35,7 @@ REASON_LABELS = {
     "login_failed": "网站登录失败",
     "vps_read_failed": "未能读取 VPS 信息",
     "renewal_failed": "续期失败",
-    "renewal_unverified": "尚未确认到期日延长",
+    "renewal_unverified": "尚未确认续期成功",
     "captcha_failed": "验证码处理失败",
     "renewal_code_unavailable": "未获取到续期验证码",
     "warp_failed": "WARP 切换失败",
@@ -42,16 +43,68 @@ REASON_LABELS = {
     "warp_connection_failed": "未能核实 WARP 连接",
     "warp_ip_query_failed": "未取得有效的 WARP 出口 IP",
     "warp_new_exit_unavailable": "未取得新的 WARP 出口",
+    "telegram_session_invalid": "Telegram Web 登录态失效",
+    "hax_session_invalid": "Hax 登录态失效",
+    "hax_page_unverified": "未能确认 Hax 登录后的页面",
+    "access_blocked": "网站访问验证未通过",
+    "network_failed": "认证页面连接失败",
+    "telegram_peer_unverified": "未能核实 Hax 机器人会话",
+    "renewal_code_ambiguous": "本轮出现多个验证码，已停止选码",
+    "browser_unavailable": "无法启动或操作认证浏览器",
+    "hax_authorization_required": "Hax 的已有网站授权不可用",
+    "hax_account_mismatch": "Hax 登录组件识别到的账号不符",
+    "hax_widget_unverified": "未能核实 Hax 官方登录组件",
+    "hax_callback_unverified": "Hax 登录结果未通过校验",
+    "hax_rules_unavailable": "无法准备 Hax 页面规则",
+    "adblock_detected": "Hax 广告检测拦截了页面",
     "timeout": "续期脚本运行超时",
     "cancelled": "执行已取消",
     "worker_error": "续期进程异常退出",
     "invalid_configuration_or_report": "配置或运行报告未通过校验",
 }
 
+REASON_HINTS = {
+    "telegram_session_invalid": "请在本机重新登录 Telegram Web，更新对应会话后手动触发任务。",
+    "hax_session_invalid": "请在本机重新登录 Hax，更新对应会话后手动触发任务。",
+    "hax_page_unverified": "当前不能认定登录态失效，请检查站点页面与访问验证。",
+    "access_blocked": "请检查网站访问验证；访问受阻不代表登录态失效。",
+    "network_failed": "请检查运行环境的网络连接后重新触发任务。",
+    "telegram_peer_unverified": "请检查 Telegram Web 是否正常加载 Hax 业务会话。",
+    "renewal_code_ambiguous": "请核对本轮业务消息与站点结果，避免重复提交已成功的续期。",
+    "browser_unavailable": "请检查浏览器依赖及运行环境，当前不能认定登录态失效。",
+    "hax_authorization_required": "请在专用浏览器中手动恢复 Hax 网站授权，更新 Hax 凭据后重新触发任务。",
+    "hax_account_mismatch": "请核对 Hax 网站授权与账号配置，任务已停止，不读取其他账号的 VPS。",
+    "hax_widget_unverified": "请检查网站和登录组件是否正常加载；任务不会猜测账号或执行新的授权。",
+    "hax_callback_unverified": "账号、来源或登录数据未通过校验，请检查网站与凭据后手动处理。",
+    "hax_rules_unavailable": "请检查项目规则文件和浏览器连接，确认规则能够在访问 Hax 前注册。",
+    "adblock_detected": "请检查内置规则是否生效或网站检测是否变化；该提示不代表登录凭据失效。",
+}
+
 
 def empty_details() -> dict[str, Any]:
     """初始计数不代表通知已经执行。"""
     return {**dict.fromkeys(DETAIL_COUNTERS, 0), "reason": "none"}
+
+
+def validate_authentication_result(value: object) -> dict[str, Any]:
+    """只读结果只接受固定原因和认证分类，拒绝页面或异常原文。"""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "status", "reason", "checks"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or not isinstance(value["status"], str)
+        or value["status"] not in {"valid", "failed"}
+        or not isinstance(value["reason"], str)
+        or value["reason"] not in RUNTIME_REASONS
+        or (value["status"] == "valid") != (value["reason"] == "none")
+        or not isinstance(value["checks"], dict)
+        or set(value["checks"]) - {"authentication"}
+    ):
+        raise ValueError("invalid_auth_report")
+    if value["checks"]:
+        validate_details({**empty_details(), "checks": value["checks"]})
+    return dict(value)
 
 
 def validate_runtime(value: object) -> dict[str, Any]:
@@ -154,7 +207,7 @@ def render_summary(
     elif summary:
         parts = []
         for key, label in (
-            ("renewed", "已延长"),
+            ("renewed", "续期成功" if platform == "hax" else "已延长"),
             ("skipped", "无需续期"),
             ("failed", "续期失败"),
             ("unverified", "待核实"),
@@ -180,7 +233,7 @@ def render_summary(
         elif summary["unverified"]:
             headline = "⚠️ 续期结果待核实"
         elif summary["renewed"]:
-            headline = "✅ 已验证延长"
+            headline = "✅ 续期成功" if platform == "hax" else "✅ 已验证延长"
         elif summary["skipped"]:
             headline = "⏭️ 无需续期"
         else:
@@ -253,11 +306,13 @@ def render_summary(
     ]
     if reason != "none":
         lines += [f"> {REASON_LABELS[reason]}", ""]
+        if reason in REASON_HINTS:
+            lines += [REASON_HINTS[reason], ""]
     failure_stage = {
         "login_failed": "登录网站",
         "vps_read_failed": "读取 VPS 信息",
         "renewal_failed": "执行续期",
-        "renewal_unverified": "核对到期日",
+        "renewal_unverified": "核对站点结果" if platform == "hax" else "核对到期日",
         "captcha_failed": "验证码处理",
         "renewal_code_unavailable": "等待续期验证码",
         "warp_failed": "切换 WARP",
@@ -265,6 +320,20 @@ def render_summary(
         "warp_connection_failed": "核实 WARP 连接",
         "warp_ip_query_failed": "查询 WARP 出口",
         "warp_new_exit_unavailable": "更换 WARP 出口",
+        "telegram_session_invalid": "恢复 Telegram Web 登录态",
+        "hax_session_invalid": "恢复 Hax 登录态",
+        "hax_page_unverified": "检查 Hax 页面",
+        "access_blocked": "网站访问验证",
+        "network_failed": "连接认证页面",
+        "telegram_peer_unverified": "核实业务会话",
+        "renewal_code_ambiguous": "选择本轮续期码",
+        "browser_unavailable": "准备认证浏览器",
+        "hax_authorization_required": "读取已有网站授权",
+        "hax_account_mismatch": "核对网站授权账号",
+        "hax_widget_unverified": "核实 Hax 登录组件",
+        "hax_rules_unavailable": "准备 Hax 页面规则",
+        "adblock_detected": "检查 Hax 广告检测",
+        "hax_callback_unverified": "核对 Hax 登录结果",
     }.get(reason)
     if (
         details["text_failed"]
@@ -304,6 +373,8 @@ def render_summary(
         "</details>",
         "",
     ]
+    if platform == "hax" and summary and summary["renewed"]:
+        lines += ["续期成功依据本轮站点反馈确认；当天重复续期时，到期日可以不变。", ""]
     return "\n".join(lines)
 
 

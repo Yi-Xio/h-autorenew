@@ -5,13 +5,13 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-from scripts.accounts import public_account_id, state_key
+from scripts.accounts import Account, public_account_id, state_key
 from scripts.public_report import iso_date
 
 CACHE_FILE = Path("output/renewal-state.json")
 
 
-def read_observed_state(path: Path, fields: Sequence[str]) -> str | None:
+def read_observed_state(path: Path, fields: Sequence[str] | Account) -> str | None:
     """只接受受控入口导出的本账号可靠日期或无 VPS 状态。"""
     try:
         if path.stat().st_size > 256:
@@ -19,7 +19,8 @@ def read_observed_state(path: Path, fields: Sequence[str]) -> str | None:
         key, state = path.read_text(encoding="utf-8").strip().split(",")
     except FileNotFoundError:
         return None
-    if key != state_key(fields[0]) or (state != "NOVPS" and iso_date(state) is None):
+    phone = fields.phone if isinstance(fields, Account) else fields[0]
+    if key != state_key(phone) or (state != "NOVPS" and iso_date(state) is None):
         raise ValueError("invalid_state")
     return state
 
@@ -52,7 +53,7 @@ def prepare_cached_state(
     path: Path,
     observed: Path,
     platform: str,
-    fields: Sequence[str],
+    fields: Sequence[str] | Account,
     restored: bool = True,
 ) -> str:
     """校验本轮导出后按需更新本地快照，远端传输交给官方 Cache Action。"""

@@ -9,11 +9,11 @@ permissions:
   contents: read
 
 jobs:
-  # 这里只生成数字序号；各账号恢复自己的缓存后独立预筛。
+  # 矩阵只包含匿名键和展示序号，各账号独立恢复缓存。
   build-matrix:
     if: github.ref == 'refs/heads/master'
     environment: renewal
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
@@ -24,7 +24,7 @@ jobs:
       - name: 生成账号矩阵
         id: matrix
         env:
-          BATCH: ${{ secrets.BATCH }}
+          RENEWAL_ACCOUNTS: ${{ secrets.RENEWAL_ACCOUNTS }}
         run: python3 -m scripts.workflow matrix hax
 
   account:
@@ -35,17 +35,18 @@ jobs:
     permissions:
       contents: read
       actions: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     concurrency:
-      # 每个账号独立一组，矩阵 job 并行执行，同账号跨平台运行也防重叠。
-      group: renewal-account-${{ matrix.index }}
+      # 以匿名键防止同账号重叠，不传递用户填写的账号标识符。
+      group: renewal-hax-${{ matrix.key }}
       cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-matrix.outputs.matrix) }}
     env:
       BATCH_ACCOUNT_INDEX: ${{ matrix.index }}
+      RENEWAL_ACCOUNT_KEY: ${{ matrix.key }}
       DEBUG_FLAG: '0'
       PUBLIC_SUMMARY_DEFERRED: '1'
       SKIP_DAYS: '5'
@@ -54,8 +55,6 @@ jobs:
       MAX_RENEW_RETRIES: '5'
       # IP 被封时切换 WARP 重试次数（内层）
       MAX_WARP_RETRIES: '10'
-      # 登录重试次数
-      MAX_LOGIN_RETRIES: '1'
     steps:
       - name: 检出仓库
         id: checkout
@@ -66,7 +65,7 @@ jobs:
       - name: 准备账号缓存
         id: cache-key
         env:
-          BATCH: ${{ secrets.BATCH }}
+          RENEWAL_ACCOUNTS: ${{ secrets.RENEWAL_ACCOUNTS }}
         run: python3 -m scripts.workflow setup-cache hax
 
       # 每轮都恢复本账号缓存，全部跳过时也保持访问。
@@ -85,7 +84,7 @@ jobs:
       - name: 判断本账号是否需要运行
         id: decide
         env:
-          BATCH: ${{ secrets.BATCH }}
+          RENEWAL_ACCOUNTS: ${{ secrets.RENEWAL_ACCOUNTS }}
           CACHE_RESTORE_OUTCOME: ${{ steps.restore-cache.outcome }}
         run: python3 -m scripts.workflow check hax
 
@@ -93,7 +92,9 @@ jobs:
         id: notify-skipped
         if: steps.decide.outputs.should_run == 'false'
         env:
-          BATCH: ${{ secrets.BATCH }}
+          RENEWAL_ACCOUNTS: ${{ secrets.RENEWAL_ACCOUNTS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DAYS_LEFT: ${{ steps.decide.outputs.days_left }}
         run: python3 -m scripts.workflow notify-skipped hax
 
@@ -106,21 +107,13 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: 缓存 Chromium apt 包
-        if: steps.decide.outputs.should_run == 'true'
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/hax-apt/*.deb
-          key: apt-chromium-${{ runner.os }}-${{ runner.arch }}-v1
-
       - name: 安装依赖
         id: install-dependencies
         if: steps.decide.outputs.should_run == 'true'
         run: |
-          mkdir -p "$HOME/.cache/hax-apt/partial"
           sudo apt-get update
-          sudo apt-get -o Dir::Cache::archives="$HOME/.cache/hax-apt" \
-            install -y xvfb chromium ffmpeg unzip curl wget jq ca-certificates
+          sudo apt-get install -y xvfb ffmpeg unzip curl wget jq ca-certificates
+          command -v google-chrome >/dev/null
           pip install --upgrade pip
           pip install -r requirements.txt -q
           python3 -c 'import speech_recognition, pydub, audioop; print("语音依赖导入成功")'
@@ -153,7 +146,9 @@ jobs:
         if: steps.decide.outputs.should_run == 'true'
         id: renew
         env:
-          BATCH: ${{ secrets.BATCH }}
+          RENEWAL_ACCOUNTS: ${{ secrets.RENEWAL_ACCOUNTS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PROXY_CONTENT: ${{ secrets.PROXY_URL }}
           SOCKS_PORT: ${{ secrets.SOCKS_PORT || '10808' }}
         run: python3 -m scripts.actions_runtime hax
@@ -164,7 +159,7 @@ jobs:
         id: state
         if: always() && !cancelled() && (steps.renew.outcome == 'success' || steps.renew.outcome == 'failure')
         env:
-          BATCH: ${{ secrets.BATCH }}
+          RENEWAL_ACCOUNTS: ${{ secrets.RENEWAL_ACCOUNTS }}
           CACHE_RESTORE_OUTCOME: ${{ steps.restore-cache.outcome }}
         run: python3 -m scripts.workflow prepare-state hax
 

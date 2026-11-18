@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, platform, requests, re, json, subprocess, socket, threading
+import os, sys, time, platform, requests, re, json, subprocess, socket
 os.environ["PATH"] = os.path.expanduser("~/bin") + os.pathsep + os.environ.get("PATH", "")
 import tempfile, html as html_mod, random
 from datetime import datetime, timezone, timedelta, date
@@ -12,14 +12,21 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from gen_singbox_config import setup_proxy
 from scripts.public_report import (
     WARP_FAILURE_REASONS,
+    authentication_result,
     publish_progress,
     publish_results,
+    record_check,
     record_notification,
     renewal_verified,
     screenshot_allowed,
 )
 from scripts.telegram import telegram_accepted
-from scripts.job_summary import REASON_LABELS
+from scripts.renewal_config import notification_config, worker_account
+from scripts.web_auth import AuthenticationError, TelegramWeb, new_telegram_reader
+from scripts.hax_login import hax_status, restore_hax, wait_hax_navigation
+from scripts.browser_setup import install_hax_rules
+from scripts.hax_result import RenewalFeedback
+from scripts.job_summary import REASON_HINTS, REASON_LABELS
 
 # ── 可选依赖：reCAPTCHA 语音识别 ──────────────────────────────────────
 try:
@@ -29,14 +36,6 @@ try:
 except ImportError as e:
     HAS_SPEECH = False
     print(f"[WARN] 语音识别依赖不可用: {type(e).__name__}: {e}")
-
-# ── 可选依赖：Telethon (Telegram MTProto) ─────────────────────────────
-try:
-    from telethon import TelegramClient, events, functions
-    from telethon.sessions import StringSession
-    HAS_TELETHON = True
-except ImportError:
-    HAS_TELETHON = False
 
 # ── 可选依赖：ddddocr (验证码识别) ────────────────────────────────────
 try:
@@ -73,10 +72,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 #     ├─ 第3轮拿到新IP → 用新IP重新提交（内层只消耗了3轮）
 #     └─ 20轮全是重复IP → 未取得新出口 → 停止本次续期
 # ════════════════════════════════════════════════════════════════════
-# 账号列表："手机号,tg_bot_token,tg_chat_id,tg_api_id,tg_api_hash,tg_session"，多账号用分号分隔
-BATCH = os.environ.get("BATCH", "")
-# 登录重试次数（登录页验证码/网络问题导致登录失败时）
-MAX_LOGIN_RETRIES = int(os.environ.get("MAX_LOGIN_RETRIES", "1").strip())
+# Hax 仅通过受控入口传入单账号 Web 会话，不再使用六字段 BATCH。
 # 【外层】每个续期 URL 的整体流程重试次数（实际执行 = 该值 + 1 次）
 MAX_RENEW_RETRIES_PER_URL = int(os.environ.get("MAX_RENEW_RETRIES", "5").strip())
 # 【中层】提交验证码后被服务器以 captcha 错误拒绝时，"换 WARP IP → 重新提交"
@@ -102,17 +98,8 @@ def _dbg(msg):
 
 CN_TZ = timezone(timedelta(hours=8))
 
-# ── Telegram MTProto API（由 BATCH 每账号提供，此处为全局默认值）────
-TG_API_ID = 0
-TG_API_HASH = ""
-TG_SESSION = ""
-HAX_BOT = "@HaxTG_bot"
-HAX_BOT_ID = 1967189265
-TG_OFFICIAL_ID = 777000
-
 HAX_BASE_URL = "https://hax.co.id"
 HAX_TITLE = "hax.co.id"
-HAX_LOGIN_URL = f"{HAX_BASE_URL}/login"
 HAX_VPS_INFO_URL = f"{HAX_BASE_URL}/vps-info"
 HAX_VPS_RENEW_URL = f"{HAX_BASE_URL}/vps-renew"
 HAX_VPS_RENEW_CODE_URL = f"{HAX_BASE_URL}/vps-renew-code"
@@ -131,337 +118,6 @@ def _parse_iso_date(s: str):
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         return None
-
-
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Telegram 验证码提取         ║
-# ╚══════════════════════════════════════════════════════════════════════╝
-
-class TGVerificationCodeExtractor:
-    """
-    从指定 Telegram 账号的指定联系人对话中提取验证码。
-    支持两种模式：
-      - history: 一次性提取最近 N 条消息中的验证码
-      - watch:   实时监听新消息，提取验证码
-    """
-
-    CODE_RE = re.compile(
-        r'(?:验证码|验证|码|Code|Cod|OTP|Код|код|passcode|pin)[^\d]{0,20}?(\d{4,8})',
-        re.IGNORECASE,
-    )
-    BASE64_CODE_RE = re.compile(
-        r'(?:code|Your Code is)[\s:]+([A-Za-z0-9+/=_\-]{20,})',
-        re.IGNORECASE,
-    )
-    FALLBACK_RE = re.compile(r'(?<!\d)(\d{4,8})(?!\d)')
-
-    def __init__(self, api_id: int = None, api_hash: str = None,
-                 tg_session: str = None, proxy: str = None):
-        if not HAS_TELETHON:
-            raise RuntimeError("Telethon 未安装，请运行: pip install telethon")
-        self.api_id = api_id if api_id is not None else TG_API_ID
-        self.api_hash = api_hash if api_hash is not None else TG_API_HASH
-        self._tg_session = tg_session
-        self.proxy = proxy
-        self._client = None
-
-    # ── 内部: 创建客户端 ──────────────────────────────────────────────
-    def _make_client(self, session_str: str = "") -> TelegramClient:
-        proxy_cfg = None
-        if self.proxy:
-            from urllib.parse import urlparse
-            p = urlparse(self.proxy)
-            proxy_cfg = {
-                'proxy_type': 'socks5',
-                'addr': p.hostname or '127.0.0.1',
-                'port': p.port or 10808,
-            }
-        return TelegramClient(
-            StringSession(session_str), self.api_id, self.api_hash,
-            proxy=proxy_cfg, connection_retries=5, timeout=30,
-        )
-
-    def _load_session(self) -> str:
-        return self._tg_session if self._tg_session else TG_SESSION
-
-    @staticmethod
-    async def _resolve_entity(client, target):
-        """解析目标实体，支持用户名、数字 ID、手机号"""
-        try:
-            return await client.get_input_entity(target)
-        except Exception:
-            pass
-        # 尝试 get_entity 在线解析（用户名/手机号等）
-        try:
-            entity = await client.get_entity(target)
-            return await client.get_input_entity(entity)
-        except Exception:
-            pass
-        # 数字 ID 尝试转 int
-        if str(target).isdigit():
-            try:
-                return await client.get_input_entity(int(target))
-            except Exception:
-                pass
-            try:
-                entity = await client.get_entity(int(target))
-                return await client.get_input_entity(entity)
-            except Exception:
-                pass
-        raise ValueError(f"Cannot find entity: {target}")
-
-    # ── 公开: 提取验证码 ──────────────────────────────────────────────
-    @staticmethod
-    def extract_codes(text: str) -> List[str]:
-        """从文本中提取验证码候选，支持数字码和 base64 码"""
-        if not text:
-            return []
-        found = set()
-
-        # 1. 数字验证码
-        m = TGVerificationCodeExtractor.CODE_RE.search(text)
-        if m:
-            found.add(m[1])
-
-        # 2. Base64 验证码 (Your Code is <base64>)
-        for m in TGVerificationCodeExtractor.BASE64_CODE_RE.finditer(text):
-            b64_str = m.group(1).strip()
-            if len(b64_str) >= 20:
-                found.add(b64_str)
-
-        # 3. 兜底: 纯数字
-        if not found:
-            cleaned = re.sub(r'[+\s-]', '', text)
-            for d in TGVerificationCodeExtractor.FALLBACK_RE.findall(cleaned):
-                if 4 <= len(d) <= 8 and not re.match(r'^(19|20)\d{2}$', d):
-                    found.add(d)
-
-        return list(found)
-
-    async def fetch_history(self, target: str, limit: int = 100) -> List[Dict[str, str]]:
-        """
-        一次性提取目标对话最近 N 条消息中的验证码。
-        target: 机器人用户名如 '@HaxTG_bot' 或联系人 ID
-        返回: [{"code": "123456", "message": "...", "time": "..."}]
-        """
-        session_str = self._load_session()
-        if not session_str:
-            print("  [WARN] TG session 不存在，跳过验证码提取")
-            return []
-
-        client = self._make_client(session_str)
-        await client.connect()
-        results = []
-        try:
-            entity = await self._resolve_entity(client, target)
-            messages = await client.get_messages(entity, limit=limit)
-            for msg in messages:
-                if not msg.message:
-                    continue
-                codes = self.extract_codes(msg.message)
-                for c in codes:
-                    results.append({
-                        "code": c,
-                        "message": msg.message[:200],
-                        "time": msg.date.isoformat() if msg.date else "",
-                    })
-                    print(f"  [INFO] TG 提取到验证码: {mask_code(c)}")
-        except Exception as e:
-            print(f"  [WARN] TG 提取验证码失败: {e}")
-        finally:
-            await client.disconnect()
-        return results
-
-    async def watch_for_code(self, target: str, timeout: int = 120) -> Optional[str]:
-        """
-        实时监听目标对话的新消息，等待验证码出现。
-        timeout: 最长等待秒数
-        返回: 第一个提取到的验证码，或 None
-        """
-        session_str = self._load_session()
-        if not session_str:
-            print("  [WARN] TG session 不存在，跳过验证码监听")
-            return None
-
-        client = self._make_client(session_str)
-        await client.connect()
-        result_holder: Dict[str, Optional[str]] = {"code": None}
-
-        try:
-            entity = await self._resolve_entity(client, target)
-            bot_id = entity.channel_id if hasattr(entity, 'channel_id') else (
-                entity.user_id if hasattr(entity, 'user_id') else None
-            )
-
-            @client.on(events.NewMessage)
-            async def handler(event):
-                msg = event.message
-                from_id = None
-                if msg.sender_id:
-                    from_id = msg.sender_id
-                elif msg.peer_id:
-                    from_id = getattr(msg.peer_id, 'channel_id',
-                                     getattr(msg.peer_id, 'user_id', None))
-                if bot_id and from_id and str(from_id) != str(bot_id):
-                    return
-                if msg.message:
-                    codes = self.extract_codes(msg.message)
-                    if codes:
-                        result_holder["code"] = codes[0]
-                        print(f"  [INFO] TG 实时捕获验证码: {mask_code(codes[0])}")
-
-            print(f"  [INFO] TG 开始监听 {target} 的新消息 (超时 {timeout}s)...")
-            start = time.time()
-            while time.time() - start < timeout:
-                if result_holder["code"]:
-                    break
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            print(f"  [WARN] TG 监听失败: {e}")
-        finally:
-            await client.disconnect()
-
-        return result_holder["code"]
-
-    async def confirm_tg_auth(self, target: str, timeout: int = 60) -> bool:
-        """
-        监听目标对话的授权消息，提取 Confirm 按钮的 callback_data 并点击。
-        用于 登录流程中777000发送的 Telegram Widget 授权请求。
-        返回: 是否成功点击了 Confirm
-        """
-        session_str = self._load_session()
-        if not session_str:
-            print("  [WARN] TG session 不存在，跳过授权确认")
-            return False
-
-        client = self._make_client(session_str)
-        await client.connect()
-        confirmed = False
-
-        try:
-            entity = await self._resolve_entity(client, target)
-            bot_id = entity.channel_id if hasattr(entity, 'channel_id') else (
-                entity.user_id if hasattr(entity, 'user_id') else None
-            )
-
-            async def try_confirm(msg):
-                nonlocal confirmed
-                if confirmed or not msg.buttons:
-                    return
-                for row in msg.buttons:
-                    for btn in row:
-                        data = btn.data
-                        if not data:
-                            continue
-                        try:
-                            data_str = data.decode("utf-8") if isinstance(data, bytes) else str(data)
-                        except Exception:
-                            continue
-                        if "au_confirm" in data_str:
-                            print("  [INFO] 已找到 TG 官方联系人对话中的 Confirm 按钮")
-                            try:
-                                await client(functions.messages.GetBotCallbackAnswerRequest(
-                                    peer=msg.peer_id,
-                                    msg_id=msg.id,
-                                    data=data if isinstance(data, bytes) else data.encode("utf-8"),
-                                ))
-                                print("  [INFO] ✅ Confirm 已完成点击")
-                                confirmed = True
-                            except Exception as e:
-                                err_str = str(e)
-                                if "Constructor ID" in err_str or "TLObject" in err_str:
-                                    print(f"  [INFO] ✅ Confirm 已点击（response 解析异常，但请求已发送）")
-                                    confirmed = True
-                                else:
-                                    print(f"  [WARN] Confirm 点击失败: {e}")
-                            return
-
-            # 先检查最近消息（可能777000消息已经到了）
-            print(f"  [INFO] TG 检查 {target} 最近消息...")
-            recent = await client.get_messages(entity, limit=10)
-            for msg in recent:
-                if msg and msg.buttons:
-                    await try_confirm(msg)
-            if confirmed:
-                return True
-
-            # 再监听新消息
-            @client.on(events.NewMessage)
-            async def handler(event):
-                msg = event.message
-                from_id = None
-                if msg.sender_id:
-                    from_id = msg.sender_id
-                elif msg.peer_id:
-                    from_id = getattr(msg.peer_id, 'channel_id',
-                                     getattr(msg.peer_id, 'user_id', None))
-                if bot_id and from_id and str(from_id) != str(bot_id):
-                    return
-                await try_confirm(msg)
-
-            print(f"  [INFO] TG 监听 {target} 等待授权消息 (超时 {timeout}s)...")
-            start = time.time()
-            while time.time() - start < timeout:
-                if confirmed:
-                    break
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            print(f"  [WARN] TG 授权确认失败: {e}")
-        finally:
-            await client.disconnect()
-
-        return confirmed
-
-
-# ── 同步封装：在非 async 环境中调用 TG 提取器 ─────────────────────────
-import asyncio
-
-def tg_extract_codes_sync(target: str, limit: int = 100,
-                          proxy: str = None) -> List[Dict[str, str]]:
-    """同步版：一次性提取目标对话验证码"""
-    extractor = TGVerificationCodeExtractor(proxy=proxy)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, extractor.fetch_history(target, limit)).result()
-        else:
-            return loop.run_until_complete(extractor.fetch_history(target, limit))
-    except RuntimeError:
-        return asyncio.run(extractor.fetch_history(target, limit))
-
-def tg_wait_for_code_sync(target: str, timeout: int = 120,
-                          proxy: str = None) -> Optional[str]:
-    """同步版：监听目标对话等待新验证码"""
-    extractor = TGVerificationCodeExtractor(proxy=proxy)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, extractor.watch_for_code(target, timeout)).result()
-        else:
-            return loop.run_until_complete(extractor.watch_for_code(target, timeout))
-    except RuntimeError:
-        return asyncio.run(extractor.watch_for_code(target, timeout))
-
-def tg_confirm_auth_sync(target: str, timeout: int = 60,
-                         proxy: str = None) -> bool:
-    """同步版：监听目标对话，自动点击 Confirm 按钮确认授权"""
-    extractor = TGVerificationCodeExtractor(proxy=proxy)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, extractor.confirm_tg_auth(target, timeout)).result()
-        else:
-            return loop.run_until_complete(extractor.confirm_tg_auth(target, timeout))
-    except RuntimeError:
-        return asyncio.run(extractor.confirm_tg_auth(target, timeout))
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -533,6 +189,9 @@ class DPBrowser:
         self.page = page
         self.active = page
         self.driver = _DPDriver(self)
+        self.web_account: Dict[str, Any] = {}
+        self.telegram_reader: TelegramWeb | None = None
+        self.renewal_submission: RenewalFeedback | None = None
     def set_active(self, handle):
         self.page.activate_tab(handle)
         self.active = self.page.get_tab(handle)
@@ -591,15 +250,15 @@ class WarpError(RuntimeError):
 
 
 class CaptchaBlocked(Exception):
-    """IP 被 Google reCAPTCHA 封锁"""
+    """验证码处理未完成，由调用方决定是否恢复。"""
     pass
 
 class CaptchaAudioUnavailable(CaptchaBlocked):
-    """当前出口无法取得 reCAPTCHA 音频资源，必须换 IP。"""
+    """无法取得或处理 reCAPTCHA 音频挑战。"""
     pass
 
 class ArithmeticCaptchaUnavailable(CaptchaBlocked):
-    """算术验证码无法识别或填入，必须换 IP 重试。"""
+    """算术验证码无法识别或填入。"""
     pass
 
 
@@ -620,6 +279,31 @@ class RecaptchaAudioSolver:
     def _frame(self,k):
         try: return self.browser.page.get_frame(f'css:iframe[src*="recaptcha"][src*="{k}"]',timeout=5)
         except Exception: return None
+    def _ready_anchor(self):
+        """在原有五秒查找预算内等待复选框就绪，不把驱动异常记成控件缺失。"""
+        deadline = time.monotonic() + 5
+        failure = 'anchor_missing'
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                record_check('captcha', 'recaptcha', failure)
+                return False
+            try:
+                frame = self.browser.page.get_frame(
+                    'css:iframe[src*="recaptcha"][src*="anchor"]',
+                    timeout=min(0.5, remaining),
+                )
+                failure = 'anchor_loading' if frame else 'anchor_missing'
+                if frame and frame.run_js('''
+                    const anchor = document.getElementById('recaptcha-anchor');
+                    return !!(anchor && anchor.getClientRects().length
+                        && anchor.getAttribute('role') === 'checkbox'
+                        && anchor.getAttribute('aria-disabled') !== 'true');
+                ''', timeout=min(1, max(0.1, deadline - time.monotonic()))) is True:
+                    return True
+            except Exception:
+                failure = 'frame_unavailable'
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
     def is_solved(self):
         try:
             for frame in self.browser.page.get_frames():
@@ -638,36 +322,48 @@ class RecaptchaAudioSolver:
             return False
     def _is_blocked(self):
         f=self._frame('bframe')
-        try: return bool(f and f.run_js("var h=document.querySelector('.rc-doscaptcha-header-text'),e=document.querySelector('.rc-audiochallenge-error-message');return !!((h&&h.textContent.toLowerCase().includes('try again later'))||(e&&e.offsetParent!==null));"))
+        try:
+            status = f.run_js("var h=document.querySelector('.rc-doscaptcha-header-text'),e=document.querySelector('.rc-audiochallenge-error-message');return h&&h.textContent.toLowerCase().includes('try again later')?'blocked':e&&e.offsetParent!==null?'audio_error':'clear';") if f else 'clear'
+            if status in {'blocked', 'audio_error'}:
+                record_check('captcha', 'recaptcha', status)
+                return True
+            return False
         except Exception: return False
     def click_checkbox(self):
         f=self._frame('anchor')
-        if not f: raise RuntimeError('未找到 reCAPTCHA anchor iframe')
+        if not f:
+            record_check('captcha', 'recaptcha', 'anchor_missing')
+            raise RuntimeError('未找到 reCAPTCHA anchor iframe')
         f.frame_ele.click.at(offset_x=35,offset_y=35); time.sleep(3)
-        if self._is_blocked(): raise CaptchaBlocked('点击复选框后 IP 被封锁')
+        if self._is_blocked(): raise CaptchaBlocked('点击复选框后 reCAPTCHA 显示错误')
     def switch_to_audio(self):
         f = self._frame('bframe')
         if not f:
+            record_check('captcha', 'audio_challenge', 'frame_missing')
             raise CaptchaAudioUnavailable('未找到 reCAPTCHA challenge frame')
         try:
             box = f.ele('#audio-response', timeout=2)
             if not box:
                 button = f.ele('#recaptcha-audio-button', timeout=5)
                 if not button:
+                    record_check('captcha', 'audio_challenge', 'button_missing')
                     raise CaptchaAudioUnavailable('未找到 reCAPTCHA 音频按钮')
                 button.click()
                 time.sleep(5)
                 box = f.ele('#audio-response', timeout=5)
             if not box:
+                record_check('captcha', 'audio_challenge', 'input_missing')
                 raise CaptchaAudioUnavailable('点击音频按钮后未进入音频挑战')
             return True
         except CaptchaAudioUnavailable:
             raise
         except Exception as e:
+            record_check('captcha', 'audio_challenge', 'interaction_failed')
             raise CaptchaAudioUnavailable(f'切换音频挑战失败: {type(e).__name__}') from e
     def _audio_url(self):
         f = self._frame('bframe')
         if not f:
+            record_check('captcha', 'audio_source', 'frame_missing')
             raise CaptchaAudioUnavailable('未找到 reCAPTCHA challenge frame')
         try:
             src = ''
@@ -680,16 +376,19 @@ class RecaptchaAudioSolver:
             if not src:
                 src = f.run_js("return document.querySelector('#audio-source')?.src || document.querySelector('.rc-audiochallenge-tdownload-link,.rc-audiochallenge-ndownload-link')?.href || ''") or ''
             if not src:
+                record_check('captcha', 'audio_source', 'url_missing')
                 raise CaptchaAudioUnavailable('音频挑战已打开但未下发 audio-source 链接')
             print(f"  [INFO] 已获取 reCAPTCHA 音频链接（长度 {len(src)}）")
             return src
         except CaptchaAudioUnavailable:
             raise
         except Exception as e:
+            record_check('captcha', 'audio_source', 'read_failed')
             raise CaptchaAudioUnavailable(f'读取音频链接失败: {type(e).__name__}') from e
 
     def _download_audio(self, url):
         if not url:
+            record_check('captcha', 'audio_download', 'url_missing')
             raise CaptchaAudioUnavailable('音频链接为空')
         page = self.browser.active
         session = requests.Session()
@@ -708,14 +407,17 @@ class RecaptchaAudioSolver:
             'Referer': page.url or 'https://www.google.com/recaptcha/',
             'Accept': 'audio/mp3,audio/*;q=0.9,*/*;q=0.8',
         }
+        failure = 'network_failed'
         try:
             r = session.get(url, headers=headers, timeout=30)
             content_type = (r.headers.get('content-type') or '').lower()
             r.raise_for_status()
             if len(r.content) < 1000 or ('text/html' in content_type and len(r.content) < 100000):
+                record_check('captcha', 'audio_download', 'invalid_response')
                 raise CaptchaAudioUnavailable(
                     f'音频响应无效: status={r.status_code}, type={content_type or "unknown"}, bytes={len(r.content)}'
                 )
+            failure = 'write_failed'
             fd, path = tempfile.mkstemp(suffix='.mp3')
             os.close(fd)
             Path(path).write_bytes(r.content)
@@ -723,7 +425,26 @@ class RecaptchaAudioSolver:
             return path
         except CaptchaAudioUnavailable:
             raise
+        except requests.HTTPError as e:
+            record_check('captcha', 'audio_download', 'http_failed')
+            raise CaptchaAudioUnavailable('音频服务返回 HTTP 错误') from e
+        except requests.exceptions.ConnectTimeout as e:
+            record_check('captcha', 'audio_download', 'connect_timeout')
+            raise CaptchaAudioUnavailable('音频服务连接超时') from e
+        except requests.exceptions.ReadTimeout as e:
+            record_check('captcha', 'audio_download', 'read_timeout')
+            raise CaptchaAudioUnavailable('读取音频响应超时') from e
+        except requests.exceptions.SSLError as e:
+            record_check('captcha', 'audio_download', 'tls_failed')
+            raise CaptchaAudioUnavailable('音频服务的安全连接未建立') from e
+        except requests.exceptions.ProxyError as e:
+            record_check('captcha', 'audio_download', 'proxy_failed')
+            raise CaptchaAudioUnavailable('音频请求的代理连接失败') from e
+        except requests.exceptions.ConnectionError as e:
+            record_check('captcha', 'audio_download', 'connection_failed')
+            raise CaptchaAudioUnavailable('音频服务连接失败') from e
         except Exception as e:
+            record_check('captcha', 'audio_download', failure)
             raise CaptchaAudioUnavailable(f'音频下载失败: {type(e).__name__}') from e
     @classmethod
     def _recognize_audio(cls, mp3):
@@ -736,12 +457,14 @@ class RecaptchaAudioSolver:
                 capture_output=True, text=True, timeout=30,
             )
             if convert.returncode != 0 or not os.path.exists(wav):
+                record_check('captcha', 'audio_decode', 'failed')
                 detail = (convert.stderr or '').strip().splitlines()
                 detail = detail[-1][:160] if detail else 'no ffmpeg detail'
                 print(f"  [WARN] ffmpeg 解码失败: rc={convert.returncode}, {detail}")
                 return None
             wav_header = Path(wav).read_bytes()[:12]
             if not (wav_header[:4] == b'RIFF' and wav_header[8:12] == b'WAVE'):
+                record_check('captcha', 'audio_decode', 'invalid_wav')
                 print("  [WARN] ffmpeg 输出不是有效 WAV")
                 return None
             print(f"  [INFO] ffmpeg 解码成功: WAV={os.path.getsize(wav)} bytes")
@@ -750,16 +473,24 @@ class RecaptchaAudioSolver:
             with sr.AudioFile(wav) as src:
                 raw = rec.recognize_google(rec.record(src))
             answer = (raw or '').strip()
+            if not answer:
+                record_check('captcha', 'audio_recognition', 'empty')
             print(f"  [INFO] 音频识别原文: {answer[:200]!r}")
             print(f"  [INFO] 音频识别完成: 原文长度={len(answer)}")
             return answer or None
         except sr.UnknownValueError:
+            record_check('captcha', 'audio_recognition', 'unrecognized')
             print("  [WARN] 音频识别失败: Google 无法识别语音")
             return None
         except sr.RequestError as e:
+            record_check('captcha', 'audio_recognition', 'service_failed')
             print(f"  [WARN] 音频识别失败: Google 请求异常 {type(e).__name__}")
             return None
+        except subprocess.TimeoutExpired:
+            record_check('captcha', 'audio_decode', 'timeout')
+            return None
         except Exception as e:
+            record_check('captcha', 'audio_recognition', 'failed')
             print(f"  [WARN] 音频处理失败: {type(e).__name__}: {str(e)[:120]}")
             return None
         finally:
@@ -773,7 +504,9 @@ class RecaptchaAudioSolver:
         try:
             box=f.ele('#audio-response',timeout=5); btn=f.ele('#recaptcha-verify-button',timeout=5)
             if box and btn: box.input(text,clear=True); btn.click(); return True
-        except Exception: pass
+            record_check('captcha', 'audio_verify', 'controls_missing')
+        except Exception:
+            record_check('captcha', 'audio_verify', 'interaction_failed')
         return False
     def _reload(self):
         f=self._frame('bframe')
@@ -782,22 +515,33 @@ class RecaptchaAudioSolver:
             if b: b.click()
         except Exception: pass
     def solve(self):
-        if not HAS_SPEECH or not self._frame('anchor'): return False
+        if not HAS_SPEECH:
+            record_check('captcha', 'recaptcha', 'dependency_missing')
+            return False
+        if not self._ready_anchor():
+            return False
         for i in range(self.MAX_ATTEMPTS):
-            if self.is_solved(): return True
-            if self._is_blocked(): raise CaptchaBlocked('IP 被 Google reCAPTCHA 封锁')
+            if self.is_solved():
+                record_check('captcha', 'recaptcha', 'passed')
+                return True
+            if self._is_blocked(): raise CaptchaBlocked('reCAPTCHA 显示验证错误')
             if i==0:
                 try: self.click_checkbox(); time.sleep(2)
                 except CaptchaBlocked: raise
                 except Exception: pass
-                if self.is_solved(): return True
+                if self.is_solved():
+                    record_check('captcha', 'recaptcha', 'passed')
+                    return True
             self.switch_to_audio()
             text=self._recognize_audio(self._download_audio(self._audio_url()))
             if text and self._fill_verify(text):
                 time.sleep(4)
-                if self.is_solved(): return True
+                if self.is_solved():
+                    record_check('captcha', 'recaptcha', 'passed')
+                    return True
+                record_check('captcha', 'audio_verify', 'not_solved')
             self._reload(); time.sleep(2)
-        raise CaptchaBlocked('reCAPTCHA 音频识别连续失败，换 IP 重试')
+        raise CaptchaBlocked('reCAPTCHA 音频验证未完成')
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -1142,17 +886,23 @@ class ArithmeticCaptchaSolver(CaptchaSolver):
     def _fill_answer(self, browser, answer: str) -> bool:
         """第三步（回填）：把计算结果写入 #captcha 输入框。"""
         try:
-            browser.execute_script(f'''
+            filled = browser.execute_script(f'''
                 var input = document.getElementById('captcha') || document.querySelector('input[name="captcha"]');
                 if (input) {{
                     input.value = '{answer}';
                     input.dispatchEvent(new Event('input', {{bubbles: true}}));
                     input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return input.value === '{answer}';
                 }}
+                return false;
             ''')
+            if filled is not True:
+                record_check('captcha', 'arithmetic', 'input_missing')
+                return False
             print(f"  [ARITHMETIC] 已填入: {answer}")
             return True
         except Exception as e:
+            record_check('captcha', 'arithmetic', 'input_failed')
             print(f"  [ARITHMETIC] ⚠️ 填入失败: {e}")
             return False
 
@@ -1160,6 +910,7 @@ class ArithmeticCaptchaSolver(CaptchaSolver):
         """编排：提取运算式 → 取操作数 → 计算 → 回填。返回答案字符串，失败返回 None。"""
         captcha_info = self._extract_expression(browser)
         if not captcha_info:
+            record_check('captcha', 'arithmetic', 'expression_missing')
             return None
 
         img1_src = captcha_info.get("img1", "")
@@ -1169,11 +920,13 @@ class ArithmeticCaptchaSolver(CaptchaSolver):
 
         num1, num2 = self._extract_operands(browser, img1_src, img2_src)
         if num1 is None or num2 is None:
+            record_check('captcha', 'arithmetic', 'operands_unavailable')
             print("  [ARITHMETIC] ❌ 数字获取失败（OCR 与文件名均未得到结果）")
             return None
 
         result = self._calc(num1, op, num2)
         if result is None:
+            record_check('captcha', 'arithmetic', 'unsupported_operation')
             print(f"  [ARITHMETIC] ⚠️ 计算失败（未知运算符或除零）: {num1} {op} {num2}")
             return None
 
@@ -1182,6 +935,7 @@ class ArithmeticCaptchaSolver(CaptchaSolver):
 
         if not self._fill_answer(browser, answer):
             return None
+        record_check('captcha', 'arithmetic', 'passed')
         return answer
 
 
@@ -1586,53 +1340,26 @@ def notify_no_server(username: str, img: str = None, tg_token: str = None, tg_ch
 
 
 def notify_login_fail(username: str, img: str = None, tg_token: str = None, tg_chat: str = None,
-                      ip_info: str = "", phone_mask: str = ""):
+                      ip_info: str = "", phone_mask: str = "", reason: str = "login_failed"):
     token = tg_token
     chat = tg_chat
     if not token or not chat: return
     try:
         masked_phone = phone_mask or mask(username)
         header = _tg_header(masked_phone, chat, ip_info)
+        detail = REASON_LABELS.get(reason, "登录失败")
+        hint = REASON_HINTS.get(reason, "请检查登录状态后手动触发任务。")
         text = (
                 f"<b>🎮 {HAX_TITLE} 续期报告</b>\n"
                 f"{header}"
 
-            f"❌ 登录失败\n"
+            f"❌ {detail}\n{hint}\n"
         )
         if img and Path(img).exists():
             send_tg_photo(token, chat, img, text)
         else:
             send_tg_message(token, chat, text)
     except: pass
-
-def parse_accounts(s: str) -> List[Dict[str, str]]:
-    accounts = []
-    # 格式: phone,tg_bot_token,tg_chat_id[,tg_api_id,tg_api_hash,tg_session]
-    # 多账号用分号分隔
-    for line in re.split(r'[\n;]', s):
-        line = line.strip()
-        if not line:
-            continue
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) < 1:
-            print(f"[WARN] 格式错误，跳过: {line}")
-            continue
-        phone = parts[0]
-        acc = {
-            "phone": phone,
-            "phoneMask": mask_phone(phone),
-            "tg_token": parts[1] if len(parts) > 1 else None,
-            "tg_chat": parts[2] if len(parts) > 2 else None,
-        }
-        # 可选：每个账号独立的 TG API 凭据
-        if len(parts) > 3 and parts[3]:
-            acc["tg_api_id"] = parts[3]
-        if len(parts) > 4 and parts[4]:
-            acc["tg_api_hash"] = parts[4]
-        if len(parts) > 5 and parts[5]:
-            acc["tg_session"] = parts[5]
-        accounts.append(acc)
-    return accounts
 
 def dismiss_cookie_only(browser) -> bool:
     try:
@@ -1677,6 +1404,7 @@ def hax_handle_turnstile(browser, idx: int) -> bool:
     dismiss_cookie_only(browser)
 
     if check_turnstile_done(browser):
+        record_check('captcha', 'turnstile', 'passed')
         print("  [INFO] Turnstile 已完成（直接检测到 token）")
         # token 已生成，再等 5s 让 Cloudflare 服务器端完成验证
         time.sleep(5)
@@ -1689,6 +1417,7 @@ def hax_handle_turnstile(browser, idx: int) -> bool:
         time.sleep(3)
 
         if check_turnstile_done(browser):
+            record_check('captcha', 'turnstile', 'passed')
             print(f"  [INFO] Turnstile 通过 ({attempt+1}/3)")
             time.sleep(5)
             return True
@@ -1700,6 +1429,7 @@ def hax_handle_turnstile(browser, idx: int) -> bool:
     start = time.time()
     while time.time() - start < 30:
         if check_turnstile_done(browser):
+            record_check('captcha', 'turnstile', 'passed')
             print("  [INFO] Turnstile 已完成")
             time.sleep(5)
             return True
@@ -1709,6 +1439,7 @@ def hax_handle_turnstile(browser, idx: int) -> bool:
 
     # ── reCAPTCHA 兜底 ──
     print("  [INFO] Turnstile 未通过，检查是否有 reCAPTCHA...")
+    record_check('captcha', 'turnstile', 'token_missing')
     if handle_recaptcha_fallback(browser, idx):
         return True
     return False
@@ -1748,433 +1479,11 @@ def handle_recaptcha_fallback(browser, idx: int) -> bool:
         return False
 
 
-def hax_click_accept(browser, idx: int) -> bool:
-    """点击网页中的 Accept 按钮（confirmRequest）"""
-    print("  [INFO] 点击 Accept...")
-    time.sleep(3)
-    try:
-        clicked = browser.execute_script('''
-            if (typeof confirmRequest === "function") {
-                confirmRequest();
-                return true;
-            }
-            var btn = document.querySelector('button[onclick*="confirmRequest"]');
-            if (btn) { btn.click(); return true; }
-            return false;
-        ''')
-        if not clicked:
-            print("  [INFO] 使用 DrissionPage 原生按钮点击 Accept...")
-            accept = browser.active.ele('css:button.button-item', timeout=5)
-            if accept:
-                accept.click()
-        time.sleep(5)
-        # 滚动到 "VPS Information"
-        try:
-            browser.execute_script('''
-                (function() {
-                    var els = document.querySelectorAll('h1, h2, h3, h4, div, span, p');
-                    for (var i = 0; i < els.length; i++) {
-                        if (els[i].textContent.trim() === 'VPS Information') {
-                            els[i].scrollIntoView({block: "start", behavior: "instant"});
-                            return;
-                        }
-                    }
-                })()
-            ''')
-            time.sleep(0.5)
-        except Exception:
-            pass
-        safe_screenshot(browser, shot(idx, "hax_login_after_accept"))
-        return True
-    except Exception as e:
-        print(f"  [WARN] Accept 点击异常: {e}")
-        return False
-
-
-def hax_login_flow(browser, phone: str, idx: int, proxy: str = None) -> bool:
-    """
-    登录流程（Telegram Widget），支持重试。
-
-    流程:
-        1. 绕过 CF → 访问 /login
-        2. 进入 Telegram Widget iframe → 点 "Log in with Telegram"
-        3. 弹出 oauth.telegram.org 新窗口 → 填国家代码 + 手机号 → Continue
-        4. Telethon 自动点击777000对话中的 Confirm
-        5. 回到弹窗点 Accept
-        6. 回到主页面验证登录成功
-
-    重试机制:
-        - 最多重试 MAX_LOGIN_RETRIES 次（默认 5 次，可通过环境变量覆盖）
-        - 任一次成功立即返回 True，不再继续重试
-        - 所有重试均失败则返回 False
-
-    Args:
-        browser: DrissionPage 浏览器实例
-        phone: 手机号，格式如 "+503-72796921"
-        idx: 账号序号，用于截图命名
-        proxy: SOCKS5 代理地址
-
-    Returns:
-        True 登录成功，False 登录失败
-    """
-    # 解析手机号：必须用 - 分隔，如 +503-72796921
-    raw = phone.strip()
-    if "-" not in raw:
-        print(f"  [ERROR] 手机号格式错误，需要包含 - 分隔国家代码和手机号，如 503-72796921")
-        return False
-    parts = raw.split("-", 1)
-    country_code = parts[0].lstrip("+").strip()
-    phone_num = parts[1].strip()
-
-    for login_attempt in range(1, MAX_LOGIN_RETRIES + 1):
-        if login_attempt > 1:
-            print(f"\n{'─'*40}")
-            print(f"  [INFO] 登录重试 {login_attempt}/{MAX_LOGIN_RETRIES}")
-            print(f"{'─'*40}")
-
-        print(f"\n{'─'*40}")
-        print(f"  [INFO] hax 登录流程")
-        print(f"{'─'*40}")
-        print(f"  [INFO] 国家代码: +{country_code}, 手机号: {mask_phone(raw)}")
-
-        ok = _hax_login_flow_inner(browser, country_code, phone_num, raw, idx, proxy)
-        if ok:
-            return True
-        if login_attempt < MAX_LOGIN_RETRIES:
-            print(f"  [INFO] 等待 5s 后重试...")
-            time.sleep(5)
-        else:
-            print(f"  [ERROR] 登录重试已达上限 ({MAX_LOGIN_RETRIES}次)")
-
-    return False
-
-
-def _hax_login_flow_inner(browser, country_code: str, phone_num: str, raw: str,
-                          idx: int, proxy: str = None) -> bool:
-    """
-    hax 登录流程内部实现（单次尝试，不含重试）。
-
-    Args:
-        browser: DrissionPage 浏览器实例
-        country_code: 国家代码，如 "503"
-        phone_num: 手机号（不含国家代码），如 "72796921"
-        raw: 原始手机号（含国家代码和分隔符），用于日志
-        idx: 账号序号，用于截图命名
-        proxy: SOCKS5 代理地址
-
-    Returns:
-        True 登录成功，False 登录失败（由外层 hax_login_flow 决定是否重试）
-    """
-    # 1. 绕过 Cloudflare
-    print("  [INFO] 访问 登录页...")
-    browser.open(HAX_LOGIN_URL)
-    time.sleep(5)
-
-    cf_passed = False
-    for attempt in range(6):
-        src = browser.get_page_source()
-        title = (browser.get_title() or "").lower()
-        is_cf = any(i in src for i in ["Just a moment", "Verify you are human"]) or "just a moment" in title
-        if not is_cf:
-            cf_passed = True
-            break
-        print(f"  [INFO] Cloudflare 挑战，绕过中 ({attempt+1}/6)...")
-        try:
-            browser.click_turnstile()
-        except Exception:
-            pass
-        time.sleep(6)
-    if not cf_passed:
-        return False
-
-    time.sleep(2)
-
-    removeAds(browser)
-
-    # 滚动到 "Login to Hax.co.id"
-    try:
-        browser.execute_script('''
-            (function() {
-                var els = document.querySelectorAll('h1, h2, h3, h4, div, span, p');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].textContent.indexOf('Login to Hax') !== -1) {
-                        els[i].scrollIntoView({block: "start", behavior: "instant"});
-                        return;
-                    }
-                }
-            })()
-        ''')
-        time.sleep(0.5)
-    except Exception:
-        pass
-    safe_screenshot(browser, shot(idx, "hax_login_page"))
-
-    # 2. 等待 Telegram Widget iframe 加载（最多18秒）
-    print("  [INFO] 查找 Telegram Widget iframe...")
-    main_window = browser.driver.current_window_handle
-    iframe_found = False
-    for wait_round in range(6):
-        iframe_found = browser.execute_script('''
-            return !!document.querySelector('#telegram-login-LoginHaxBot');
-        ''')
-        if iframe_found:
-            break
-        # 也尝试宽松匹配
-        iframe_found = browser.execute_script('''
-            (function() {
-                var iframes = document.querySelectorAll("iframe");
-                for (var i = 0; i < iframes.length; i++) {
-                    var src = (iframes[i].src || "").toLowerCase();
-                    var id = (iframes[i].id || "").toLowerCase();
-                    if (src.indexOf("telegram") !== -1 || id.indexOf("telegram") !== -1) return true;
-                }
-                return false;
-            })()
-        ''')
-        if iframe_found:
-            break
-        print(f"  [INFO] 等待 Telegram Widget 加载... ({wait_round + 1}/6)")
-        time.sleep(3)
-
-    if not iframe_found:
-        print("  [ERROR] 未找到 Telegram Widget iframe")
-        safe_screenshot(browser, shot(idx, "hax_login_no_iframe"))
-        return False
-
-    print("  [INFO] 进入 Telegram Widget iframe...")
-    try:
-        tg_frame = browser.page.get_frame('css:iframe#telegram-login-LoginHaxBot', timeout=10)
-    except Exception:
-        tg_frame = None
-    if not tg_frame:
-        print("  [ERROR] Telegram Widget iframe 获取失败")
-        safe_screenshot(browser, shot(idx, "hax_login_no_iframe"))
-        return False
-
-    print("  [INFO] 使用 DrissionPage 原生元素点击 Log in with Telegram...")
-    popup_tab = None
-    login_element = None
-    before_tabs = set(browser.page.tab_ids)
-    try:
-        candidates = tg_frame.eles('tag:a', timeout=5) or []
-        candidates += tg_frame.eles('tag:button', timeout=1) or []
-        for element in candidates:
-            text = (element.text or '').strip().lower()
-            if 'log in' in text or 'login' in text or 'telegram' in text:
-                login_element = element
-                break
-        if login_element:
-            # 优先使用 DrissionPage 官方的 for_new_tab()。
-            try:
-                popup_tab = login_element.click.for_new_tab(timeout=15)
-            except Exception as e:
-                print(f"  [WARN] for_new_tab 失败，改用原生点击+轮询: {type(e).__name__}")
-                # Telegram Widget 的 window.open() 偶尔晚于 for_new_tab 的等待窗口。
-                login_element.click()
-                deadline = time.time() + 15
-                while time.time() < deadline:
-                    new_tabs = [t for t in browser.page.tab_ids if t not in before_tabs]
-                    if new_tabs:
-                        popup_tab = browser.page.get_tab(new_tabs[-1])
-                        break
-                    time.sleep(0.2)
-    except Exception as e:
-        print(f"  [WARN] Telegram Widget 原生点击异常: {type(e).__name__}: {e}")
-    browser.driver.switch_to.default_content()
-
-    if not popup_tab:
-        print("  [ERROR] Telegram 点击后没有创建 OAuth 标签页")
-        safe_screenshot(browser, shot(idx, "hax_login_no_tg_btn"))
-        return False
-
-    popup_handle = popup_tab.tab_id
-    browser.set_active(popup_handle)
-    print(f"  [INFO] OAuth 标签页已捕获: {browser.get_current_url()}")
-    time.sleep(2)
-    # 滚动到 "Login to Hax.co.id"
-    try:
-        browser.execute_script('''
-            (function() {
-                var els = document.querySelectorAll('h1, h2, h3, h4, div, span, p');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].textContent.indexOf('Login to Hax.co.id') !== -1) {
-                        els[i].scrollIntoView({block: "start", behavior: "instant"});
-                        return;
-                    }
-                }
-            })()
-        ''')
-        time.sleep(0.5)
-    except Exception:
-        pass
-    safe_screenshot(browser, shot(idx, "hax_login_after_iframe_click"))
-
-    # 3. for_new_tab() 已捕获 OAuth 标签页；确认 URL 后继续填写手机号。
-    popup_url = browser.get_current_url()
-    if "oauth.telegram.org" not in popup_url:
-        print(f"  [WARN] 新标签页 URL 非 Telegram OAuth: {popup_url[:120]}")
-    else:
-        print(f"  [INFO] OAuth 标签页已确认: {popup_url}")
-    safe_screenshot(browser, shot(idx, "hax_login_popup"))
-
-    # 4. OAuth 页面异步渲染完成后，用 DrissionPage 原生元素填写手机号
-    print("  [INFO] 填写手机号...")
-    phone_code_el = browser.active.ele('#login-phone-code', timeout=15)
-    phone_el = browser.active.ele('#login-phone', timeout=15)
-    if not phone_code_el or not phone_el:
-        print("  [ERROR] OAuth 页面手机号输入框未加载")
-        safe_screenshot(browser, shot(idx, "hax_login_no_phone_code"))
-        return False
-
-    target_code = f'+{country_code}'
-    current_code = phone_code_el.property('value') or phone_code_el.attr('value') or ''
-    print(f"  [INFO] OAuth 当前国家码: {current_code or '未知'}，目标: {target_code}")
-    # Telegram 的 requestConfirmation() 直接读取 #login-phone-code.value；
-    # 不依赖国家下拉菜单，使用 DrissionPage 原生输入同步真实 input 状态。
-    print(f"  [INFO] 直接输入国家码: {target_code}")
-    phone_code_el.input(target_code, clear=True, by_js=True)
-    phone_code_el.run_js("this.dispatchEvent(new Event('input', {bubbles: true})); this.dispatchEvent(new Event('change', {bubbles: true}));")
-    time.sleep(0.5)
-    current_code = phone_code_el.property('value') or phone_code_el.attr('value') or ''
-    if current_code != target_code:
-        print(f"  [ERROR] 国家码输入未生效: 当前 {current_code or '未知'}，目标 {target_code}")
-        safe_screenshot(browser, shot(idx, "hax_login_wrong_country"))
-        return False
-
-    print(f"  [INFO] 输入手机号: {mask_phone(phone_num)}")
-    phone_el.input(phone_num, clear=True)
-    time.sleep(1)
-    safe_screenshot(browser, shot(idx, "hax_login_phone_filled"))
-
-    # 5. 使用 DrissionPage 原生点击 Continue
-    print("  [INFO] 点击 Continue...")
-    continue_btn = browser.active.ele('css:button[type="submit"]', timeout=5)
-    if not continue_btn:
-        print("  [ERROR] OAuth Continue 按钮未加载")
-        return False
-    continue_btn.click()
-    time.sleep(5)
-    safe_screenshot(browser, shot(idx, "hax_login_after_continue"))
-
-    # 检查是否出现 "We've just sent you a message"
-    page_text = browser.execute_script('return document.body ? document.body.innerText : ""') or ""
-    if "sent you a message" in page_text.lower() or "confirm" in page_text.lower():
-        print("  [INFO] 已发送授权消息，等待确认...")
-    else:
-        print(f"  [WARN] 页面内容: {page_text[:200]}")
-
-    # 6. Confirm 确认（Telethon 自动 或 等待手动）
-    auth_ok = False
-    if HAS_TELETHON:
-        print("  [INFO] 通过 Telethon 点击 Confirm 按钮...")
-        try:
-            auth_ok = tg_confirm_auth_sync(str(TG_OFFICIAL_ID), timeout=60, proxy=proxy)
-            if auth_ok:
-                print("  [INFO] ✅ Confirm 已确认")
-            else:
-                print("  [WARN] Confirm 未找到或点击失败")
-        except Exception as e:
-            print(f"  [WARN] Telethon Confirm 确认失败: {e}")
-
-    # 7. 回到弹窗，等待 Accept 按钮出现并点击
-    print("  [INFO] 回到弹窗，等待 Accept 按钮...")
-
-    accept_clicked = False
-    popup_closed = False
-
-    if popup_handle:
-        try:
-            browser.set_active(popup_handle)
-        except Exception:
-            popup_closed = True
-            print("  [INFO] 弹窗已自动关闭（登录可能已成功）")
-
-    if not popup_closed:
-        max_wait = 90 if not auth_ok else 15
-        if not auth_ok:
-            max_wait = 15
-            print(f"  [INFO] Telethon 未确认，等待 Accept 按钮（{max_wait}s）...")
-
-        for wait in range(max_wait):
-            time.sleep(2)
-            try:
-                has_accept = browser.execute_script('''
-                    if (typeof confirmRequest === "function") return true;
-                    var btn = document.querySelector('button[onclick*="confirmRequest"]');
-                    if (btn) return true;
-                    var btns = document.querySelectorAll('button.button-item');
-                    for (var i = 0; i < btns.length; i++) {
-                        if ((btns[i].textContent || "").trim().toLowerCase() === 'accept') return true;
-                    }
-                    return false;
-                ''')
-            except Exception:
-                popup_closed = True
-                print("  [INFO] 弹窗已关闭")
-                break
-            if has_accept:
-                print(f"  [INFO] Accept 按钮已出现 ({wait*2}s)")
-                hax_click_accept(browser, idx)
-                accept_clicked = True
-                break
-            if wait % 5 == 0 and wait > 0:
-                print(f"  [INFO] 等待中... ({wait*2}s/{max_wait}s)")
-
-        if not accept_clicked and not popup_closed:
-            print("  [WARN] Accept 按钮未出现")
-
-    # 8. 切回主页面验证登录
-    print("  [INFO] 切回主页面...")
-    browser.set_active(main_window)
-    time.sleep(5)
-    # 滚动到 "VPS Information"
-    try:
-        browser.execute_script('''
-            (function() {
-                var els = document.querySelectorAll('h1, h2, h3, h4, div, span, p');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].textContent.trim() === 'VPS Information') {
-                        els[i].scrollIntoView({block: "start", behavior: "instant"});
-                        return;
-                    }
-                }
-            })()
-        ''')
-        time.sleep(0.5)
-    except Exception:
-        pass
-    safe_screenshot(browser, shot(idx, "hax_login_after_accept"))
-
-    # 验证登录成功
-    print("  [INFO] 验证登录成功...")
-    login_verified = False
-
-    if HAS_TELETHON:
-        try:
-            codes = tg_extract_codes_sync(str(TG_OFFICIAL_ID), limit=3)
-            for c in codes:
-                msg = c.get("message", "")
-                if "successfully logged in" in msg.lower() or "telegram widgets" in msg.lower():
-                    login_verified = True
-                    print(f"  [INFO] ✅ 登录成功确认: {msg[:80]}")
-                    break
-        except Exception as e:
-            print(f"  [WARN] TG官方 消息检查: {e}")
-
-    if not login_verified:
-        current_url = browser.get_current_url()
-        print(f"  [INFO] 当前 URL: {current_url}")
-        if "/login" not in current_url.lower():
-            login_verified = True
-            print("  [INFO] ✅ 登录成功（URL 已跳转）")
-
-    if login_verified:
-        print("  [INFO] ✅ 登录成功")
-        return True
-
-    print("  [WARN] 登录状态不确定，请检查截图")
-    safe_screenshot(browser, shot(idx, "hax_login_uncertain"))
-    return False
+def hax_login_flow(browser, phone: str, idx: int, proxy: str | None = None) -> bool:
+    """恢复分别手动准备的 Hax 与 Telegram Web 登录态，不自动授权。"""
+    browser.telegram_reader = new_telegram_reader(browser.web_account["telegram_web"], proxy)
+    restore_hax(browser, browser.web_account["hax_web"])
+    return True
 
 
 def hax_get_vps_info(browser, idx: int) -> Tuple[List[Dict[str, str]], str, Optional[str]]:
@@ -2220,6 +1529,8 @@ def hax_get_vps_info(browser, idx: int) -> Tuple[List[Dict[str, str]], str, Opti
     screenshot = shot(idx, "vps_info")
     safe_screenshot(browser, screenshot)
 
+    if hax_status(browser) != "authenticated":
+        return [], "未能核实已登录的 VPS 信息页", ""
     src = browser.get_page_source()
 
     # 解析 label/div 对（VPS Information 用 Bootstrap form 布局）
@@ -2340,7 +1651,8 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
             ''')
         except Exception as e:
             print(f"  [WARN] reCAPTCHA 检测脚本异常: {type(e).__name__}: {e}")
-            has_recaptcha = None
+            record_check('captcha', 'recaptcha', 'inspection_failed')
+            raise CaptchaAudioUnavailable('未能核实 reCAPTCHA 控件') from None
         print(f"  [INFO] reCAPTCHA 检测结果: {has_recaptcha}")
 
         if has_recaptcha:
@@ -2352,6 +1664,7 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                         print("  [INFO] ✅ reCAPTCHA 验证通过(使用的是语音识别)")
                     else:
                         print("  [WARN] reCAPTCHA 自动求解失败")
+                        raise CaptchaAudioUnavailable('reCAPTCHA 验证未完成，不提交续期')
                 except CaptchaBlocked as e:
                     print(f"  [WARN] reCAPTCHA 被封锁: {e}")
                     if attempt < max_retries:
@@ -2415,8 +1728,10 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                         continue
                     else:
                         print(f"  [ERROR] reCAPTCHA 求解重试已达上限 ({max_retries}次)")
+                        raise CaptchaAudioUnavailable('reCAPTCHA 求解异常，不提交续期') from None
             else:
-                print("  [WARN] speech_recognition 未安装，跳过 reCAPTCHA")
+                record_check('captcha', 'recaptcha', 'dependency_missing')
+                raise CaptchaAudioUnavailable('语音识别依赖不可用，不提交续期')
 
         # 检查 浏览器会话是否仍然存活
         try:
@@ -2480,6 +1795,11 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                 })();
             ''')
             time.sleep(1)
+            previous_feedback = getattr(browser, 'renewal_submission', None)
+            if previous_feedback:
+                previous_feedback.close()
+            browser.renewal_submission = None
+            browser.renewal_submission = RenewalFeedback(browser.page)
             clicked = False
             for locator in ('css:button[name="submit_button"]',
                             'css:button[data-callback="onSubmit"]',
@@ -2489,6 +1809,7 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                 try:
                     element = browser.page.ele(locator, timeout=2)
                     if element:
+                        browser.renewal_submission.activate()
                         element.click()
                         clicked = True
                         print(f"  [INFO] 真实元素点击成功: {locator}")
@@ -2595,51 +1916,6 @@ def _renew_fill_form(browser, idx: int, sid_f: str) -> None:
     safe_screenshot(browser, shot(idx, f"renew_{sid_f}_after_submit"))
 
 
-def _renew_start_tg_listener(proxy: str = None, since: datetime = None):
-    """启动 TG 后台监听线程，返回 (code_holder, thread)。
-    since: 只接受此时间之后的验证码（过滤历史旧码）。"""
-    code_holder = [None]
-    tg_thread = None
-    if HAS_TELETHON:
-        def _tg_listen():
-            try:
-                # 先查历史记录（bot 可能在我们启动监听前就发了代码）
-                try:
-                    extractor = TGVerificationCodeExtractor(proxy=proxy)
-                    history = asyncio.run(extractor.fetch_history(HAX_BOT, limit=20))
-                    for h in history:
-                        if not h.get("code"):
-                            continue
-                        # 时间过滤：只认本次运行开始之后的码，避免拿到上次运行的旧码
-                        if since and h.get("time"):
-                            try:
-                                msg_time = datetime.fromisoformat(h["time"])
-                                if msg_time.tzinfo is None:
-                                    msg_time = msg_time.replace(tzinfo=timezone.utc)
-                                if msg_time < since:
-                                    print(f"  [INFO] 跳过历史旧码({h['time']}): {mask_code(h['code'])}")
-                                    continue
-                            except (ValueError, TypeError):
-                                pass  # 时间解析失败则保守接受
-                        code = h['code']
-                        code_holder[0] = code
-                        masked = mask_code(code)
-                        print(f"  [INFO] TG 历史记录找到验证码: {masked}")
-                        return
-                except Exception as e:
-                    _dbg(f"TG 历史查询: {e}")
-                # 再监听新消息
-                code_holder[0] = tg_wait_for_code_sync(HAX_BOT, timeout=150, proxy=proxy)
-                if code_holder[0]:
-                    print("  [INFO] TG 后台已收到验证码")
-            except Exception as e:
-                print(f"  [WARN] TG 后台监听异常: {e}")
-        tg_thread = threading.Thread(target=_tg_listen, daemon=True)
-        tg_thread.start()
-        print("  [INFO] TG 后台监听已启动")
-    return code_holder, tg_thread
-
-
 def handoff_browser_to_warp(browser, target_url: Optional[str] = None) -> bool:
     """关闭带 sing-box 代理的 Chromium，重建无代理实例交给系统 WARP。"""
     old_page = browser.page
@@ -2652,14 +1928,14 @@ def handoff_browser_to_warp(browser, target_url: Optional[str] = None) -> bool:
     # 只恢复 HAX 登录态，避免把第三方域 cookies 带入新实例。
     cookies = [
         c for c in (cookies or [])
-        if 'hax.co.id' in str(c.get('domain', '')).lower()
-        or 'hax.co.id' in str(c.get('url', '')).lower()
+        if str(c.get('domain', '')).lower().lstrip('.') == 'hax.co.id'
     ]
     try:
         old_page.quit()
     except Exception:
         pass
 
+    new_page = None
     try:
         co = ChromiumOptions().auto_port()
         co.set_argument('--no-sandbox')
@@ -2668,22 +1944,28 @@ def handoff_browser_to_warp(browser, target_url: Optional[str] = None) -> bool:
         co.set_argument('--window-size=1920,1080')
         new_page = ChromiumPage(co)
         new_page.set.timeouts(page_load=30, script=30)
+        install_hax_rules(new_page)
         block_ad_domains(new_page)
-        new_page.get(HAX_BASE_URL)
-        new_page.wait.doc_loaded()
-        time.sleep(2)
         if cookies:
             new_page.set.cookies(cookies)
-            # cookie 注入后重新导航，确保登录态和文档状态稳定。
-            new_page.get(target_url or HAX_BASE_URL)
-            new_page.wait.doc_loaded()
-            time.sleep(3)
+        # 在第一次站点导航前恢复当前 Cookie，避免先创建另一份站点会话。
+        new_page.get(target_url or HAX_BASE_URL)
+        new_page.wait.doc_loaded()
+        time.sleep(3)
         browser.page = new_page
         browser.active = new_page
         browser.driver = _DPDriver(browser)
+        wait_hax_navigation(browser, target_url or HAX_BASE_URL)
         print(f"  [INFO] 已关闭 sing-box 代理浏览器，重建 WARP 直连浏览器（恢复 {len(cookies)} 个 HAX cookies）")
         return True
     except Exception as e:
+        if new_page is not None:
+            try:
+                new_page.quit(timeout=5, force=True, del_data=True)
+            except Exception:
+                pass
+        if isinstance(e, AuthenticationError):
+            raise
         print(f"  [ERROR] WARP 直连浏览器重建失败: {type(e).__name__}: {e}")
         return False
 
@@ -2773,21 +2055,9 @@ def _renew_navigate_to_code_page(browser, idx: int, sid_f: str, proxy: Optional[
         solve_arithmetic_captcha(browser, proxy=proxy, scene="验证码页进入后")
 
 
-def _renew_get_code(code_holder, tg_thread) -> str:
-    """等待并返回 TG 验证码，失败则抛异常"""
-    code = code_holder[0]
-    if not code and tg_thread:
-        print("  [INFO] 等待 TG 后台验证码...")
-        # TG 线程要连 Telethon + 查历史 + 监听新消息，30s 常常不够，放宽到 120s
-        tg_thread.join(timeout=120)
-        code = code_holder[0]
-
-    if not code:
-        print("  [ERROR] 未获取到续期验证码")
-        raise Exception("未获取到续期验证码")
-
-    print(f"  [INFO] 获取到验证码: {mask_code(code)}")
-    return code
+def _renew_get_code(reader) -> str:
+    """从固定业务会话等待本轮新码，不输出验证码。"""
+    return reader.wait_for_code(timeout=150)
 
 
 def _renew_refresh_code_page_after_captcha(browser, idx: int, sid_f: str,
@@ -2890,130 +2160,65 @@ def _explain_failure(resp_text: str) -> str:
 
 
 def _renew_parse_result(browser, result: dict, old_valid_until: str) -> bool:
-    """检查续期结果，更新 result 字典，返回是否成功"""
-    # 最终提交后先等待约 5 秒检查成功提醒；没有提醒再回 info 页面兜底。
-    # 先点掉提交触发的 JS alert（hax 用 alert 弹续期结果），否则后续操作全被阻塞。
-    # alert 文本单独留存：成功话术常在原生 alert 里（不在页面 DOM，截图也抓不到），需用它兜底判定。
-    alert_text = ""
+    """以本轮真实提交后的站点成功提示为主，另行核对信息页日期。"""
+    # Hax 用原生 alert 显示结果；先处理它，避免阻塞后续页面操作。
+    # 观察器在最终按钮点击前启用，只保留本轮提示的分类和日期。
     try:
-        alert_text = _drain_alerts(browser)
+        _drain_alerts(browser)
     except Exception as e:
         print(f"  [WARN] 处理弹窗异常: {type(e).__name__}: {e}")
-    time.sleep(2)
-
-    # 滚动到 "Renew VPS" 区域再截图
+    tracker = getattr(browser, "renewal_submission", None)
+    feedback = dict(status="unknown", date="", source="none", reason="none")
+    attempted = bool(tracker and tracker.active)
     try:
-        browser.execute_script('''
-            (function() {
-                var els = document.querySelectorAll('label, h2, h3, h4, div, span, p');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].textContent.trim() === 'Renew VPS') {
-                        els[i].scrollIntoView({block: "start", behavior: "instant"});
-                        return;
-                    }
-                }
-                window.scrollTo(0, document.body.scrollHeight);
-            })()
-        ''')
-        time.sleep(0.5)
-    except Exception:
-        pass
+        for attempt in range(6):
+            if tracker:
+                feedback = tracker.read()
+            if feedback["status"] != "unknown" or not attempted:
+                break
+            if attempt < 5:
+                time.sleep(4)
+    finally:
+        if tracker:
+            tracker.close()
+        browser.renewal_submission = None
 
-    # 检查结果：直接对 page.html 做正则匹配（已验证 browser.page.html 可靠，
-    # 而 execute_script 在本环境会返回空，不能依赖）。
-    # 优先 #response .alert-success；其次 .alert-danger/.alert-warning；
-    # 再兜底整页含 "renewed until" 话术。成功横幅可能延迟渲染：轮询最多 6 次 × 4 秒。
-    def _scan_html():
-        try:
-            html = browser.page.html or ""
-        except Exception as e:
-            print(f"  [WARN] 读取 page.html 失败: {type(e).__name__}: {e}")
-            return None
-        m = re.search(
-            r'id=["\']response["\'][^>]*>.*?class="[^"]*\balert-success\b[^"]*"[^>]*>(.*?)</div>',
-            html, re.S | re.I)
-        if m:
-            # 成功他会走这里
-            return {"success": True, "text": re.sub(r'\s+', ' ', m.group(1)).strip(), "dbg": "html"}
-        m = re.search(
-            r'id=["\']response["\'][^>]*>.*?class="[^"]*\balert-(?:danger|warning)\b[^"]*"[^>]*>(.*?)</div>',
-            html, re.S | re.I)
-        if m:
-            return {"success": False, "text": re.sub(r'\s+', ' ', m.group(1)).strip(), "dbg": "html"}
-        if re.search(r'renewed\s+until', html, re.I):
-            mm = re.search(r'(Your VPS has been renewed until[^<]*)', html, re.I)
-            return {"success": True, "text": (mm.group(1) if mm else "renewed until").strip(), "dbg": "html-body"}
-        return None
-
-    response_info = None
-    for _attempt in range(6):
-        response_info = _scan_html()
-        if response_info:
-            break
-        if _attempt < 5:
-            time.sleep(4)
-    if response_info:
-        print(f"  [DEBUG] 结果检测: success={response_info.get('success')} dbg={response_info.get('dbg','')} alert={str(alert_text)[:80]!r} text={str(response_info.get('text',''))[:150]!r}")
-
-    # DOM 诊断：把 #response 结构、iframe 清单、body 文本打到日志（原始界面），
-    # 兜底：原生 JS alert 弹出的续期结果（hax 常用 alert 报成功，且不在页面 DOM 内，
-    # 截图也抓不到，但 _drain_alerts 已拿到其文本）。DOM/iframe 扫描都没命中时再用它判定。
-    if not (response_info and response_info.get("success")) and alert_text:
-        if re.search(r'renewed\s+until', alert_text, re.I):
-            response_info = {"success": True, "text": alert_text.strip(), "dbg": "alert"}
-
-    # 最终结果页截图 + 状态诊断（此时横幅已渲染，状态最完整；
-    # 放在 _renew_capture_final_info 跳转之前）。均基于 page.html，不依赖 execute_script。
-    sid_f = re.sub(r'[^\w]', '_', result.get("server_id", ""))
-    idx = result.get("_idx", 0)
-    safe_screenshot(browser, shot(idx, f"renew_{sid_f}_result"))
-    result["screenshot"] = shot(idx, f"renew_{sid_f}_result")
-    try:
-        html = browser.page.html or ""
-        resp_m = re.search(r'<div id="response".*?</div>\s*</div>', html, re.S | re.I)
-        resp_html = resp_m.group(0)[:1500] if resp_m else "NO #response"
-        iframes = re.findall(r'<iframe[^>]*\bid="([^"]*)"[^>]*\bsrc="([^"]*)"', html)
-        body_m = re.search(r'<body[^>]*>(.*)</body>', html, re.S | re.I)
-        body_text = re.sub(r'<[^>]+>', ' ', body_m.group(1)) if body_m else ''
-        body_text = re.sub(r'\s+', ' ', body_text).strip()[:600]
-        print("  [DEBUG] 最终状态诊断:")
-        print(f"    #response: {resp_html}")
-        print(f"    iframes({len(iframes)}): {[(i[0], i[1][:80]) for i in iframes]}")
-        print(f"    bodyText: {body_text}")
-    except Exception as e:
-        print(f"  [WARN] 最终状态诊断失败: {e}")
-
-    # 通过 #response .alert-success 判断续期是否成功（参照标准判定逻辑）
-    if response_info and response_info.get("success"):
-        resp_text = response_info.get("text", "")
-        print(f"  [INFO] 续期成功提示: {resp_text}")
-
-        # 从 "Your VPS has been renewed until August 25, 2026" 提取新到期日
-        date_match = re.search(r'(\w+ \d{1,2}, \d{4})', resp_text)
-        if date_match:
-            new_valid_raw = date_match.group(1)
-            print(f"  [INFO] 提取到原始日期: {new_valid_raw}")
-            try:
-                new_valid = datetime.strptime(new_valid_raw, "%B %d, %Y").strftime("%Y-%m-%d")
-            except Exception:
-                new_valid = new_valid_raw
-            result["new_valid_until"] = new_valid
-            result["banner_new_valid_until"] = new_valid
-            result["expiry_info"] = f"{old_valid_until} → {new_valid}" if old_valid_until else f"新到期日: {new_valid}"
-            print(f"  [INFO] 到期日(横幅): {old_valid_until} → {new_valid}")
-
-        result["success"] = True
+    result["feedback_status"] = feedback["status"]
+    result["submission_attempted"] = attempted
+    confirmed = feedback["status"] == "success"
+    if confirmed:
+        new_valid = feedback["date"]
+        result["banner_new_valid_until"] = new_valid
+        result["new_valid_until"] = new_valid
+        result["expiry_info"] = f"{old_valid_until} → {new_valid}" if old_valid_until else f"新到期日: {new_valid}"
         result["message"] = "续期成功"
-        _renew_capture_final_info(browser, result, old_valid_until)
-        return True
+        print("  [INFO] 已核实本轮站点续期成功提示")
     else:
-        resp_text = response_info.get("text", "") if response_info else ""
-        print(f"  [WARN] 续期失败提示: {resp_text}" if resp_text else "  [WARN] 未检测到续期结果")
-        result["message"] = _explain_failure(resp_text)
-        result["detailMessage"] = resp_text
-        result["expiry_info"] = "续期失败"
-        _renew_capture_final_info(browser, result, old_valid_until)
-        return False
+        messages = {
+            "code": "续期失败: 验证码错误或已失效",
+            "captcha": "续期失败: captcha 被服务器拒绝",
+            "rejected": "续期失败: 网站拒绝本次操作",
+            "none": "续期结果待核实" if attempted else "未确认最终按钮提交",
+        }
+        result["message"] = messages[feedback["reason"]]
+        if feedback["reason"] == "captcha":
+            record_check("captcha", "site_feedback", "rejected")
+        result["detailMessage"] = ""
+        result["public_reason"] = (
+            "renewal_unverified" if attempted and feedback["status"] == "unknown"
+            else "captcha_failed" if feedback["reason"] == "captcha"
+            else "renewal_failed"
+        )
+        print(f"  [WARN] {result['message']}")
+
+    # 最后回到 VPS info 页面，截图和到期日仍以该页为准。
+    # 同一天重复续期可显示成功而日期不变，不把这种情况描述为已增加天数。
+    result["success"] = confirmed
+    message = result["message"]
+    _renew_capture_final_info(browser, result, old_valid_until)
+    result["message"] = message
+    result["success"] = confirmed
+    return confirmed
 
 
 def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
@@ -3028,7 +2233,7 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
         3. 勾 agreement
         4. 解 Turnstile
         5. 提交
-        6. Telethon 从 tg 提取验证码
+        6. Telegram Web 只从本轮业务消息提取验证码
         7. 输入验证码 → 提交
         8. 检查 #response .alert-success 判断续期是否成功
         9. 从成功提示中提取新到期日
@@ -3117,16 +2322,17 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
         result["screenshot"] = None
         result["vps_info_screenshot"] = ""
         result["info_valid_until"] = ""
+        result["feedback_status"] = "unknown"
+        result["submission_attempted"] = False
         if renew_attempt > 1:
             print(f"  [INFO] 续期重试 {renew_attempt}/{MAX_RENEW_RETRIES_PER_URL}...")
 
         result["public_reason"] = "renewal_failed"
         try:
+            # 提交之前记录业务消息基线；不使用历史旧码或操作 Telegram 按钮。
+            browser.telegram_reader.arm()
             # 1. 填写表单并提交
             _renew_fill_form(browser, idx, sid_f)
-
-            # 2. 启动 TG 监听（since=现在，只认之后到达的验证码）
-            code_holder, tg_thread = _renew_start_tg_listener(proxy, since=datetime.now(timezone.utc) - timedelta(seconds=30))
 
             # 3. 进入验证码页面 + 解算术验证码
             _renew_navigate_to_code_page(browser, idx, sid_f, proxy)
@@ -3163,7 +2369,7 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
 
             # 5. 获取 TG 验证码
             result["public_reason"] = "renewal_code_unavailable"
-            code = _renew_get_code(code_holder, tg_thread)
+            code = _renew_get_code(browser.telegram_reader)
             result["public_reason"] = "renewal_failed"
 
             # 6. 提交验证码页面 + 检查结果（captcha 错误时内层重试）
@@ -3201,7 +2407,12 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
             result["public_reason"] = e.reason
             result["message"] = str(e)
             break
+        except AuthenticationError as e:
+            result["public_reason"] = e.reason
+            result["message"] = REASON_LABELS[e.reason]
+            break
         except CaptchaBlocked as e:
+            # 保留验证码失败的具体环节，不由异常类型推断出口被封锁。
             # 此处保留已有恢复调用；验证码失败类型与换出口条件由后续重试改造统一。
             # 算术验证码即使到达普通重试上限，也额外保留一次 WARP 重试。
             is_arithmetic_failure = isinstance(e, ArithmeticCaptchaUnavailable)
@@ -3243,26 +2454,20 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
     return result
 
 
-def logout(browser):
-    try:
-        browser.open(f"{HAX_BASE_URL}/logout")
-        time.sleep(3)
-    except Exception:
-        pass
-
 def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = None,
             ip_info: str = "", proxy: str = None, phone_mask: str = "") -> Dict[str, Any]:
     result = {"username": phone, "phoneMask": phone_mask or mask_phone(phone),
               "success": False, "message": "", "servers": []}
 
-    # 1. 登录（手机号 + TG 验证码）
+    # 1. 恢复已有登录态；失效时报告，不自动请求或确认 Telegram 授权。
     publish_progress("login")
-    login_ok = hax_login_flow(browser, phone, idx, proxy=proxy)
-    if not login_ok:
-        result["message"] = "登录失败"
-        result["public_reason"] = "login_failed"
+    try:
+        hax_login_flow(browser, phone, idx, proxy=proxy)
+    except AuthenticationError as error:
+        result["message"] = REASON_LABELS[error.reason]
+        result["public_reason"] = error.reason
         notify_login_fail(phone, tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info,
-                          phone_mask=result.get("phoneMask", ""))
+                          phone_mask=result.get("phoneMask", ""), reason=error.reason)
         return result
 
     # 2. 查询 VPS 信息
@@ -3275,7 +2480,6 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
         result["message"] = "无可用服务器，无需续期"
         notify_no_server(phone, dash_shot, tg_token=tg_token, tg_chat=tg_chat,
                          ip_info=ip_info, phone_mask=result.get("phoneMask", ""))
-        logout(browser)
         return result
     if error and not servers:
         if error == "PROVISIONING":
@@ -3298,7 +2502,6 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
             notify_no_server(phone, dash_shot, tg_token=tg_token, tg_chat=tg_chat,
                              ip_info=ip_info, phone_mask=result.get("phoneMask", ""),
                              status_note="未找到可用服务器")
-        logout(browser)
         return result
 
     print(f"\n  [INFO] 找到 {len(servers)} 个服务器")
@@ -3318,7 +2521,6 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
     result["success"] = ok > 0
     result["message"] = f"{ok}/{len(result['servers'])} 成功"
 
-    logout(browser)
     return result
 
 def mask_ip(ip: str) -> str:
@@ -3651,34 +2853,10 @@ def _send_tg_report(results, masked_phone, tg_token, tg_chat, ip_info):
 def main():
     publish_progress("preparing")
     # ── 正常续期流程 ─────────────────────────────────────────────────
-    # 校验必填环境变量
-    if not BATCH:
-        print("[ERROR] 缺少必填环境变量: BATCH")
-        sys.exit(1)
-
-    acc_str = BATCH
-    accounts = parse_accounts(acc_str)
-    if not accounts:
-        print("[ERROR] BATCH中无有效账号"); sys.exit(1)
-    # 矩阵模式：只运行指定序号（1-based，对应 BATCH 中的位置）的账号；
-    # 完整 BATCH 仍只在 secrets.BATCH 内引用，避免明文进日志
-    only_idx = os.environ.get("BATCH_ACCOUNT_INDEX", "").strip()
-    if only_idx:
-        try:
-            only_idx = int(only_idx)
-            if only_idx < 1 or only_idx > len(accounts):
-                raise IndexError(f"序号 {only_idx} 超出范围 1..{len(accounts)}")
-            accounts = [accounts[only_idx - 1]]
-            print(f"[INFO] 矩阵模式：仅运行账号 #{only_idx}")
-        except Exception as e:
-            print(f"[ERROR] BATCH_ACCOUNT_INDEX 无效: {e}"); sys.exit(1)
-
-    # 检查 TG 凭据：全局或每账号至少有一套
-    has_global_tg = bool(TG_SESSION and TG_API_HASH)
-    for acc in accounts:
-        if not has_global_tg and not (acc.get("tg_api_hash") and acc.get("tg_session")):
-            print(f"[ERROR] 账号 {acc['phone']} 缺少 TG 凭据（需全局 TG_SESSION/TG_API_HASH 或 BATCH 中包含）")
-            sys.exit(1)
+    web = worker_account(os.environ)
+    token, chat = notification_config(os.environ)
+    accounts = [dict(phone=web["phone"], phoneMask=mask_phone(web["phone"]), tg_token=token, tg_chat=chat)]
+    check_only = os.environ.get("HAX_AUTH_CHECK_ONLY") == "1"
 
     print("=" * 40)
     print("  Hax Auto Renew")
@@ -3758,15 +2936,9 @@ def main():
 
     display = setup_display()
     results = []
+    browser = None
 
     try:
-        try:
-            import nest_asyncio
-            nest_asyncio.apply()
-            print("[INFO] nest_asyncio 已应用")
-        except ImportError:
-            pass
-
         # DrissionPage ChromiumPage：使用 DrissionPage ChromiumPage。
         co=ChromiumOptions().auto_port(); co.set_argument('--no-sandbox'); co.set_argument('--disable-gpu'); co.set_argument('--disable-dev-shm-usage'); co.set_argument('--window-size=1920,1080')
         if proxy:
@@ -3778,15 +2950,22 @@ def main():
         page=ChromiumPage(co); page.set.timeouts(page_load=30,script=30); block_ad_domains(page); browser=DPBrowser(page)
         get_warp_manager().record_initial_ip()
         for i, acc in enumerate(accounts, 1):
-            # 每个账号可独立设置 TG 凭据，未设置则沿用全局
-            if acc.get("tg_api_id"):
-                globals()["TG_API_ID"] = int(acc["tg_api_id"])
-            if acc.get("tg_api_hash"):
-                globals()["TG_API_HASH"] = acc["tg_api_hash"]
-            if acc.get("tg_session"):
-                globals()["TG_SESSION"] = acc["tg_session"]
+            browser.web_account = web
+            browser.telegram_reader = None
+            if check_only:
+                try:
+                    publish_progress("login")
+                    hax_login_flow(browser, acc["phone"], i, proxy)
+                    value = authentication_result("valid", "none")
+                except AuthenticationError as error:
+                    value = authentication_result("failed", error.reason)
+                    notify_login_fail(
+                        acc["phone"], tg_token=token, tg_chat=chat, reason=error.reason
+                    )
+                Path(os.environ["PUBLIC_REPORT_FILE"]).write_text(json.dumps(value))
+                return 0 if value["status"] == "valid" else 1
 
-            r=process(browser,acc["phone"],i,tg_token=acc.get("tg_token"),tg_chat=acc.get("tg_chat"),ip_info=ip_info,proxy=proxy,phone_mask=acc.get("phoneMask", ""))
+            r=process(browser,acc["phone"],i,tg_token=token,tg_chat=chat,ip_info=ip_info,proxy=proxy,phone_mask=acc.get("phoneMask", ""))
             results.append(r)
 
     except Exception as e:
@@ -3794,8 +2973,16 @@ def main():
         import traceback; traceback.print_exc()
         sys.exit(1)
     finally:
-        try: browser.quit()
-        except Exception: pass
+        try:
+            if browser is not None and browser.telegram_reader:
+                browser.telegram_reader.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.quit()
+        except Exception:
+            pass
         if display:
             display.stop()
 

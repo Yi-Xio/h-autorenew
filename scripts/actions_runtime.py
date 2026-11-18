@@ -10,13 +10,17 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from scripts.accounts import register_masks, selected_account, state_key
+from scripts.accounts import Account, register_masks, runtime_account, state_key
+from scripts.web_sessions import save_private_json
 from scripts.job_summary import (
+    AUTHENTICATION_FILE,
     RUNTIME_FILE,
+    REASON_LABELS,
     empty_details,
     render_summary,
     save_runtime,
     write_summary,
+    validate_authentication_result,
 )
 from scripts.public_report import iso_date, validate_details, validate_snapshot
 
@@ -25,7 +29,7 @@ class RunCancelled(Exception):
     """运行被取消。"""
 
 
-def run(platform: str, context: Dict[str, Any]) -> int:
+def run(platform: str, context: Dict[str, Any], check_only: bool = False) -> int:
     """启动一个账号的续期，并仅发布经过校验的报告。"""
     if platform not in {"hax", "woiden"}:
         raise ValueError("invalid_platform")
@@ -36,12 +40,15 @@ def run(platform: str, context: Dict[str, Any]) -> int:
         raise ValueError("invalid_branch")
     root = Path(__file__).resolve().parent.parent
     output = root / f"{platform}-time-value.txt"
-    output.unlink(missing_ok=True)
-    index, fields = selected_account(dict(os.environ))
+    if not check_only:
+        output.unlink(missing_ok=True)
+    fields = runtime_account(platform, dict(os.environ))
+    index = fields.index
+    context["index"] = index
     timeout = _seconds("PUBLIC_RUN_TIMEOUT_SECONDS", 3000, 3300)
     heartbeat = _seconds("PUBLIC_HEARTBEAT_SECONDS", 15, 60)
     register_masks(
-        fields
+        fields.masks()
         + [os.environ.get(name, "") for name in ("PROXY_CONTENT", "TWOCAPTCHA_API_KEY")]
     )
     previous_handlers = {
@@ -52,6 +59,7 @@ def run(platform: str, context: Dict[str, Any]) -> int:
             private = Path(temporary).resolve()
             report = private / "report.json"
             environment = _worker_environment(fields, private, report)
+            environment["HAX_AUTH_CHECK_ONLY"] = "1" if check_only else "0"
             binary = root / "sing-box"
             if binary.is_file():
                 (private / "sing-box").symlink_to(binary)
@@ -76,7 +84,7 @@ def run(platform: str, context: Dict[str, Any]) -> int:
                         except subprocess.TimeoutExpired:
                             stage, _, details = (
                                 _read_report(report)
-                                if report.exists()
+                                if report.exists() and not check_only
                                 else ("preparing", None, empty_details())
                             )
                             context.update(stage=stage, details=details)
@@ -87,6 +95,38 @@ def run(platform: str, context: Dict[str, Any]) -> int:
                             )
                 finally:
                     _stop_worker(worker)
+                if check_only:
+                    if report.stat().st_size > 1024:
+                        raise ValueError("invalid_auth_report")
+                    value = validate_authentication_result(
+                        json.loads(report.read_text())
+                    )
+                    code = (
+                        0
+                        if value["status"] == "valid" and worker.returncode == 0
+                        else 1
+                    )
+                    context.update(
+                        result="failed" if code else "complete",
+                        reason=value["reason"]
+                        if value["reason"] != "none" or not code
+                        else "worker_error",
+                        details={
+                            **empty_details(),
+                            **({"checks": value["checks"]} if value["checks"] else {}),
+                        },
+                    )
+                    for name, check in value["checks"].items():
+                        print(
+                            f"platform=hax account={index} stage=diagnostic "
+                            f"check={name} step={check['step']} result={check['result']}",
+                            flush=True,
+                        )
+                    print(
+                        f"platform=hax account={index} result={'failed' if code else 'authenticated'} mode=check-auth",
+                        flush=True,
+                    )
+                    return code
                 stage, summary, details = _read_report(report)
                 if stage != "complete" or summary is None:
                     raise ValueError("missing_result")
@@ -96,13 +136,30 @@ def run(platform: str, context: Dict[str, Any]) -> int:
                     details=details,
                     reason=details["reason"],
                 )
+                if platform == "hax":
+                    for name, check in details.get("checks", {}).items():
+                        print(
+                            f"platform=hax account={index} stage=diagnostic "
+                            f"check={name} step={check['step']} result={check['result']}",
+                            flush=True,
+                        )
+                if platform == "hax" and details.get("navigation"):
+                    navigation = details["navigation"][-1]
+                    print(
+                        f"platform=hax account={index} stage=navigation "
+                        + " ".join(
+                            f"{key}={str(value).lower()}"
+                            for key, value in navigation.items()
+                        ),
+                        flush=True,
+                    )
                 value = private / f"{platform}-time-value.txt"
                 if value.exists():
                     if value.stat().st_size > 256:
                         raise ValueError("invalid_state")
                     text = value.read_text(encoding="utf-8").strip()
                     key, state = text.split(",")
-                    if key != state_key(fields[0]) or (
+                    if key != state_key(fields.phone) or (
                         state != "NOVPS" and iso_date(state) is None
                     ):
                         raise ValueError("invalid_state")
@@ -135,9 +192,10 @@ def run(platform: str, context: Dict[str, Any]) -> int:
 def main() -> int:
     """错误路径也仅输出固定错误类别。"""
     root = Path(__file__).resolve().parent.parent
+    check_only = sys.argv[1:] == ["hax", "--check-auth"]
     platform = (
         sys.argv[1]
-        if len(sys.argv) == 2 and sys.argv[1] in {"hax", "woiden"}
+        if len(sys.argv) in {2, 3} and sys.argv[1] in {"hax", "woiden"}
         else "hax"
     )
     raw_index = os.environ.get("BATCH_ACCOUNT_INDEX", "1")
@@ -161,10 +219,13 @@ def main() -> int:
     )
     started = time.monotonic()
     try:
-        (root / RUNTIME_FILE).unlink(missing_ok=True)
-        if len(sys.argv) != 2:
+        if check_only:
+            (root / AUTHENTICATION_FILE).unlink(missing_ok=True)
+        else:
+            (root / RUNTIME_FILE).unlink(missing_ok=True)
+        if len(sys.argv) != 2 and not check_only:
             raise ValueError("invalid_arguments")
-        return run(sys.argv[1], context)
+        return run(sys.argv[1], context, check_only=check_only)
     except RunCancelled:
         context.update(result="cancelled", reason="cancelled")
         print("result=failed category=cancelled", flush=True)
@@ -185,12 +246,37 @@ def main() -> int:
     finally:
         context["elapsed_seconds"] = min(int(time.monotonic() - started), 86400)
         try:
-            save_runtime(root, context)
-            if os.environ.get("PUBLIC_SUMMARY_DEFERRED") != "1":
+            if check_only:
+                authentication = validate_authentication_result(
+                    dict(
+                        version=1,
+                        status="valid" if context["result"] == "complete" else "failed",
+                        reason=context["reason"]
+                        if context["reason"] != "none"
+                        or context["result"] == "complete"
+                        else "worker_error",
+                        checks=context["details"].get("checks", {}),
+                    )
+                )
+                destination = root / AUTHENTICATION_FILE
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(json.dumps(authentication) + "\n")
+                status = (
+                    "✅ 两类登录态检查通过"
+                    if context["result"] == "complete"
+                    else "❌ 登录态检查失败"
+                )
+                reason = REASON_LABELS.get(context["reason"], "未能完成检查")
+                write_summary(
+                    f"### Hax · 登录态检查\n\n**{status}**\n\n本次未提交续期，未改变到期日缓存。\n\n{reason}\n"
+                )
+            else:
+                save_runtime(root, context)
+            if not check_only and os.environ.get("PUBLIC_SUMMARY_DEFERRED") != "1":
                 write_summary(
                     render_summary(
                         platform,
-                        index,
+                        context["index"],
                         {
                             "RENEW_OUTCOME": "success"
                             if context["result"] == "complete"
@@ -210,19 +296,20 @@ def _seconds(name: str, default: int, maximum: int) -> int:
     return value
 
 
-def _worker_environment(
-    fields: List[str], private: Path, report: Path
-) -> Dict[str, str]:
+def _worker_environment(fields: Account, private: Path, report: Path) -> Dict[str, str]:
     environment = dict(os.environ)
     for key in list(environment):
-        if key.startswith(("GITHUB_", "ACTIONS_")) or key in {
+        if key.startswith(
+            ("GITHUB_", "ACTIONS_", "RENEWAL_", "TELEGRAM_", "TG_")
+        ) or key in {
             "GH_TOKEN",
             "PUBLIC_REPORT_FILE",
+            "BATCH",
+            "HAX_ACCOUNT_FILE",
         }:
             environment.pop(key)
     environment.update(
         {
-            "BATCH": ",".join(fields),
             "BATCH_ACCOUNT_INDEX": "1",
             "PUBLIC_REPORT_FILE": str(report),
             "SCREENSHOT_DIR": str(private / "screenshots"),
@@ -233,6 +320,16 @@ def _worker_environment(
             "PYTHONUNBUFFERED": "1",
         }
     )
+    if fields.web is not None:
+        config = private / "account.json"
+        save_private_json(config, dict(version=1, accounts=[fields.web]))
+        environment.update(
+            HAX_ACCOUNT_FILE=str(config),
+            TELEGRAM_BOT_TOKEN=fields.token,
+            TELEGRAM_CHAT_ID=fields.chat,
+        )
+    else:
+        environment["BATCH"] = ",".join(fields.legacy or [])
     return environment
 
 

@@ -18,7 +18,7 @@ from scripts.public_report import (
     validate_snapshot,
 )
 from scripts.telegram import telegram_accepted
-from tests.test_runtime import PROJECT
+from tests.regression.fixtures import PROJECT
 
 
 class TelegramTests(unittest.TestCase):
