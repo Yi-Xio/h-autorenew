@@ -45,7 +45,10 @@ class WidgetPage:
         self.responses = [ready, authorization() if payload is None else payload]
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
-        self.set = SimpleNamespace(timeouts=lambda **kwargs: None)
+        self.visited: list[str] = []
+
+    def get(self, url: str, *, retry: int, timeout: float) -> None:
+        self.visited.append(url)
 
     def run_cdp(self, method: str, **arguments: Any) -> dict[str, Any]:
         self.requests.append((method, arguments))
@@ -173,21 +176,21 @@ def renewal_browser(reader: object, events: list[str]) -> SimpleNamespace:
     def open_page(url: str) -> None:
         browser.url = url
 
-    def evaluate(script: str) -> object:
-        if "resp.innerHTML.length" in script:
-            return dict(href="https://hax.co.id/vps-renew-code", text="INPUT RENEW CODE")
-        if "link.click()" in script:
-            open_page("https://hax.co.id/vps-renew-code")
-            return True
+    def evaluate(script: str, *arguments: object) -> object:
+        if "response.querySelector" in script:
+            return "https://hax.co.id/vps-renew-code"
         if "btn.click()" in script:
             events.append("form_submit")
+            return True
+        if "return input.value === value" in script or "return input.checked" in script:
+            return True
         return None
 
     browser.open = open_page
     browser.execute_script = evaluate
     browser.page = SimpleNamespace(
         ele=lambda locator, timeout: SimpleNamespace(
-            click=lambda: events.append("final_submit")
+            click=lambda timeout: events.append("final_submit")
         ),
         handle_alert=lambda **kwargs: None,
         events=events,

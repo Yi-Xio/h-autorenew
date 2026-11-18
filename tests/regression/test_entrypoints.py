@@ -14,6 +14,19 @@ from tests.regression.fixtures import PROJECT, environment
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_live_help_exits_without_project_configuration(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hax-live-help-") as temporary:
+            script = Path(temporary) / "run.sh"
+            shutil.copy2(PROJECT / "tests/live/run.sh", script)
+            for args in ([], ["--help"], ["renew", "--help"], ["check-auth", "--help"]):
+                with self.subTest(args=args):
+                    result = subprocess.run(
+                        ["bash", str(script), *args], capture_output=True, text=True, check=True
+                    )
+                    self.assertIn("run.sh renew [--force]", result.stdout)
+                    self.assertIn("run.sh check-auth", result.stdout)
+                    self.assertEqual(result.stderr, "")
+
     def test_cancel_stops_current_container_and_releases_private_lock(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hax-entrypoint-test-") as temporary:
             root = Path(temporary)
@@ -55,7 +68,7 @@ elif arguments[0] == "stop":
                 EXAMPLE_DOCKER_ROOT=str(root),
             )
             process = subprocess.Popen(
-                ["bash", str(root / "tests/live/run.sh")],
+                ["bash", str(root / "tests/live/run.sh"), "renew"],
                 cwd=root,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -73,7 +86,7 @@ elif arguments[0] == "stop":
                 self.assertTrue((root / "stopped").exists())
                 self.assertFalse((root / ".local/state/operation.lock").exists())
                 calls = (root / "calls.txt").read_text()
-                self.assertIn("live live", calls)
+                self.assertIn("live live renew", calls)
                 self.assertNotIn("regression", calls)
             finally:
                 if process.poll() is None:

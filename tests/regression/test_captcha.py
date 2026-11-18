@@ -290,7 +290,7 @@ class CaptchaTests(unittest.TestCase):
                 self.assertRaises(self.namespace["CaptchaAudioUnavailable"]),
             ):
                 self.namespace["_prepare_final_form"](
-                    browser, 1, "example", max_retries=1
+                    browser, 1, "example"
                 )
             self.assertEqual(events, [])
             self.assertNotIn("EXAMPLE_PRIVATE", self.report.read_text())

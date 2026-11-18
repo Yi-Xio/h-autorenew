@@ -5,6 +5,8 @@ import secrets
 from datetime import datetime
 from typing import Any
 
+from scripts.hax_renewal.timing import remaining_time, require_time
+
 # DrissionPage 的 CDP 接口返回动态对象，结果在读取时逐项校验。
 Page = Any
 
@@ -91,8 +93,10 @@ _OBSERVE = r"""
 """
 
 
-def _evaluate(page: Page, expression: str) -> object:
-    result = page.run_cdp("Runtime.evaluate", expression=expression, returnByValue=True)
+def _evaluate(page: Page, expression: str, *, timeout: float) -> object:
+    result = page.run_cdp(
+        "Runtime.evaluate", expression=expression, returnByValue=True, _timeout=timeout
+    )
     if not isinstance(result, dict) or result.get("exceptionDetails"):
         return None
     value = result.get("result")
@@ -112,10 +116,14 @@ class RenewalFeedback:
             script = page.run_cdp(
                 "Page.addScriptToEvaluateOnNewDocument",
                 source=_OBSERVE + f"({argument}, false);",
+                _timeout=require_time(5),
             )
             self.script_id = script["identifier"]
-            if _evaluate(page, _OBSERVE + f"({argument}, true);") is not True:
+            if _evaluate(page, _OBSERVE + f"({argument}, true);", timeout=require_time(5)) is not True:
                 raise ValueError("renewal_page_unverified")
+        except TimeoutError:
+            self.close()
+            raise
         except Exception:
             self.close()
             raise ValueError("renewal_page_unverified") from None
@@ -132,6 +140,7 @@ class RenewalFeedback:
                 sessionStorage.setItem('__hax_renewal_feedback', JSON.stringify(state));
                 return true;
             })()""".replace("MARKER", json.dumps(self.marker)),
+            timeout=require_time(5),
         )
         if result is not True:
             raise ValueError("renewal_submission_unverified")
@@ -140,12 +149,14 @@ class RenewalFeedback:
     def read(self) -> dict[str, str]:
         """返回固定分类及 ISO 日期，不传递提示原文或网页内容。"""
         unknown = dict(status="unknown", date="", source="none", reason="none")
-        if not self.active:
+        timeout = remaining_time(5)
+        if not self.active or not timeout:
             return unknown
         try:
             value = _evaluate(
                 self.page,
                 "location.origin === 'https://hax.co.id' ? JSON.parse(sessionStorage.getItem('__hax_renewal_feedback')) : null",
+                timeout=timeout,
             )
             if (
                 not isinstance(value, dict)
@@ -187,6 +198,7 @@ class RenewalFeedback:
                     const state = JSON.parse(sessionStorage.getItem('__hax_renewal_feedback'));
                     if (state && state.marker === MARKER) sessionStorage.removeItem('__hax_renewal_feedback');
                 })()""".replace("MARKER", json.dumps(self.marker)),
+                timeout=1,
             )
         except Exception:
             pass
@@ -195,6 +207,7 @@ class RenewalFeedback:
                 self.page.run_cdp(
                     "Page.removeScriptToEvaluateOnNewDocument",
                     identifier=self.script_id,
+                    _timeout=1,
                 )
             except Exception:
                 pass

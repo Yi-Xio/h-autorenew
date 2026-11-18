@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from scripts.hax_result import RenewalFeedback
+from scripts.hax_renewal import operations
 from scripts.hax_login import hax_status, wait_hax_navigation
 from scripts.browser_setup import ADBLOCK_MESSAGE, has_adblock_dialog
 from scripts.web_sessions import AuthenticationError
@@ -113,6 +114,90 @@ class HaxResultBrowserTests(unittest.TestCase):
                 self.assertEqual(result["status"], expected)
                 return result
             time.sleep(0.05)
+
+    def test_local_form_dispatches_one_request_and_one_final_click(self) -> None:
+        self.show(
+            '<input name="web_address"><input name="agreement" type="checkbox">'
+            '<button name="submit_button" type="button">Renew VPS</button>'
+            '<div id="response"></div><script>'
+            'window.requests=0;document.querySelector("button").onclick=()=>{'
+            'window.requests++;document.querySelector("#response").innerHTML='
+            + json.dumps('<a href="https://hax.co.id/vps-renew-code">INPUT RENEW CODE</a>')
+            + ';};</script>'
+        )
+        location = dict(origin="https://hax.co.id", pathname="/vps-renew")
+
+        def execute(script: str, *arguments: object) -> object:
+            return self.page.run_js(
+                "return (function(location){return (function(){"
+                + script + "}).apply(null," + json.dumps(arguments) + ");})("
+                + json.dumps(location) + ");"
+            )
+
+        browser = SimpleNamespace(
+            execute_script=execute, get_current_url=lambda: operations.HAX_VPS_RENEW_URL
+        )
+        operations.fill_site_address(browser)
+        operations.accept_agreement(browser)
+        self.assertTrue(operations.click_code_request(browser))
+        self.assertEqual(operations.wait_for_code_link(browser), operations.HAX_VPS_RENEW_CODE_URL)
+        self.assertFalse(operations.click_code_request(browser))
+        self.assertEqual(self.page.run_js("return window.requests"), 1)
+
+        self.show(
+            FORM + '<button class="btn-primary">Fallback</button><div id="response"></div>'
+            '<script>window.requests=0;for(const button of document.querySelectorAll("button")){'
+            'button.onclick=()=>{window.requests++;document.querySelector("#response").innerHTML='
+            + json.dumps(f'<div class="alert-success">{NOTICE}</div>') + ';};}</script>'
+        )
+        location["pathname"] = "/vps-renew-code"
+        tracker = self.tracker()
+
+        def locate(selector: str, timeout: float) -> object:
+            button = self.page.ele(selector, timeout=timeout)
+            if not button:
+                return None
+
+            def click(timeout: float) -> None:
+                button.click()
+                raise OSError("EXAMPLE_CLICK_DISCONNECT")
+
+            return SimpleNamespace(click=click)
+
+        browser.page = SimpleNamespace(ele=locate, handle_alert=self.page.handle_alert)
+        browser.get_current_url = lambda: operations.HAX_VPS_RENEW_CODE_URL
+        browser.renewal_submission = tracker
+        operations.fill_renewal_code(browser, "EXAMPLE_CODE")
+        self.assertTrue(operations.click_final_button(browser))
+        self.wait_feedback(tracker, "success")
+        self.assertEqual(self.page.run_js("return window.requests"), 1)
+
+    def test_renewal_code_stays_out_of_an_unexpected_document(self) -> None:
+        self.show(FORM)
+        locations = (
+            dict(origin="https://other.invalid", pathname="/vps-renew-code"),
+            dict(origin="https://hax.co.id", pathname="/login"),
+        )
+        for location in locations:
+            with self.subTest(location=location):
+                def execute(script: str, *arguments: object) -> object:
+                    return self.page.run_js(
+                        "return (function(location){return (function(){"
+                        + script + "}).apply(null," + json.dumps(arguments) + ");})("
+                        + json.dumps(location) + ");"
+                    )
+
+                # 标签地址检查与实际填写之间，页面发生了导航。
+                browser = SimpleNamespace(
+                    execute_script=execute,
+                    get_current_url=lambda: operations.HAX_VPS_RENEW_CODE_URL,
+                )
+                with self.assertRaises(AuthenticationError) as error:
+                    operations.fill_renewal_code(browser, "EXAMPLE_CODE")
+                self.assertEqual(error.exception.reason, "hax_page_unverified")
+                self.assertEqual(
+                    self.page.run_js("return document.querySelector('input').value"), ""
+                )
 
     def test_script_text_and_existing_success_are_not_current_feedback(self) -> None:
         self.show(

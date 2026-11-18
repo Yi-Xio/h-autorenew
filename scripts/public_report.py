@@ -55,8 +55,8 @@ NAVIGATION_ENUMS = {
         "unavailable",
     },
     "document_state": {"loading", "interactive", "complete", "unavailable"},
-    "current_route": {"home", "info", "renew_code", "login", "other"},
-    "expected_route": {"home", "info", "renew_code"},
+    "current_route": {"home", "info", "renew", "renew_code", "login", "other"},
+    "expected_route": {"home", "info", "renew", "renew_code"},
 }
 CHECK_RESULTS = {
     "authentication": {
@@ -141,6 +141,7 @@ REASONS = WARP_FAILURE_REASONS | frozenset(
         "login_failed",
         "vps_read_failed",
         "renewal_failed",
+        "timeout",
         "renewal_unverified",
         "captcha_failed",
         "renewal_code_unavailable",
@@ -294,6 +295,11 @@ def record_check(name: str, step: str, result: str) -> None:
     _write_snapshot(_stage, None)
 
 
+def latest_check(name: str) -> Mapping[str, str] | None:
+    """读取最近一次已校验的检查。后续记录会替换此条记录。"""
+    return _details.get("checks", {}).get(name)
+
+
 def authentication_result(status: str, reason: str) -> Dict[str, Any]:
     """保留本轮认证检查，不把通知计数或业务结果混入只读报告。"""
     if status not in {"valid", "failed"} or reason not in REASONS:
@@ -375,6 +381,12 @@ def publish_results(results: Sequence[Mapping[str, Any]], platform: str) -> int:
     _details.update(account_failures=0, reason="none")
     state_lines = []
     for account in results:
+        if platform == "hax":
+            # 账号准备可能在处理 VPS 前结束，准备重试只统计一次。
+            count = account.get("retry_count", 0)
+            if type(count) is not int or not 0 <= count <= MAX_COUNTER:
+                raise ValueError("invalid_counter")
+            summary["retries"] += count
         servers = account.get("servers", [])
         if not servers:
             if account.get("public_state") == "no_vps":

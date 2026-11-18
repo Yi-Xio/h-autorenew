@@ -60,11 +60,17 @@ def run(platform: str, context: Dict[str, Any], check_only: bool = False) -> int
             report = private / "report.json"
             environment = _worker_environment(fields, private, report)
             environment["HAX_AUTH_CHECK_ONLY"] = "1" if check_only else "0"
+            if platform != "hax" or check_only or os.environ.get("GITHUB_ACTIONS") == "true":
+                environment.pop("HAX_FORCE_RENEWAL", None)
             binary = root / "sing-box"
             if binary.is_file():
                 (private / "sing-box").symlink_to(binary)
             started = time.monotonic()
             print(f"platform={platform} account={index} stage=preparing", flush=True)
+            if platform == "hax":
+                environment["HAX_OPERATION_DEADLINE"] = str(
+                    started + max(0, timeout - min(60, timeout / 10))
+                )
             with subprocess.Popen(
                 [sys.executable, "-u", str(root / f"{platform}-renew.py")],
                 cwd=private,

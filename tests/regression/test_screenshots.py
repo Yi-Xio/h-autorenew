@@ -10,6 +10,14 @@ from types import SimpleNamespace
 from typing import Any, Dict
 
 from scripts.public_report import publish_progress, renewal_verified, screenshot_allowed
+from scripts.hax_renewal.retry_report import (
+    RetryStep,
+    ValidationPage,
+    format_retry_report,
+    retry_scope,
+    start_retry,
+    validation_failure_detail,
+)
 from tests.regression.fixtures import PROJECT
 
 
@@ -50,6 +58,7 @@ class ScreenshotTests(unittest.TestCase):
                     "re": __import__("re"),
                     "screenshot_allowed": screenshot_allowed,
                     "renewal_verified": renewal_verified,
+                    "format_retry_report": format_retry_report,
                     "publish_progress": publish_progress,
                     f"{platform.upper()}_BASE_URL": f"https://{domain}",
                     f"{platform.upper()}_TITLE": domain,
@@ -97,21 +106,58 @@ class ScreenshotTests(unittest.TestCase):
                     browser.html = marker
                     namespace["safe_screenshot"](browser, destination)
                     self.assertEqual(browser.captured, [destination])
-                    namespace["notify"](
-                        {
-                            "screenshot": str(private / "disabled-result.png"),
-                            "vps_info_screenshot": destination,
-                            "success": True,
-                            "old_valid_until": "2026-11-10",
-                            "new_valid_until": "2026-11-20",
-                        },
-                        "+1-5550001234",
-                        tg_token="FAKE_TOKEN",
-                        tg_chat="FAKE_CHAT",
-                    )
+                    with retry_scope():
+                        start_retry(RetryStep.VPS_INFO).recovered = True
+                        start_retry(RetryStep.CODE_PAGE)
+                        start_retry(RetryStep.WARP_CONNECT)
+                        start_retry(RetryStep.WARP_CONNECT).recovered = True
+                        namespace["notify"](
+                            {
+                                "screenshot": str(private / "disabled-result.png"),
+                                "vps_info_screenshot": destination,
+                                "success": True,
+                                "old_valid_until": "2026-11-10",
+                                "new_valid_until": "2026-11-20",
+                            },
+                            "+1-5550001234",
+                            tg_token="FAKE_TOKEN",
+                            tg_chat="FAKE_CHAT",
+                        )
                 self.assertEqual(photos, [destination])
                 self.assertIn("续期结果待核实", texts[0])
                 self.assertNotIn("✅ 续期成功", texts[0])
+                if platform == "hax":
+                    self.assertIn("重试操作（4 次）", texts[0])
+                    self.assertIn("重新读取 VPS 信息页（已恢复）", texts[0])
+                    self.assertIn("重新打开本轮续期码页面（未恢复）", texts[0])
+                    self.assertIn("重新建立 WARP 连接（2 次，已恢复 1 次，未恢复 1 次）", texts[0])
+                    detail = validation_failure_detail(
+                        ValidationPage.CODE_FORM,
+                        dict(step="recaptcha", result="anchor_loading"),
+                    )
+                    with retry_scope(), contextlib.redirect_stdout(io.StringIO()):
+                        namespace["notify"](
+                            dict(success=False, message="验证码处理失败", detailMessage=detail),
+                            "+1-5550001234",
+                            tg_token="EXAMPLE_TOKEN",
+                            tg_chat="EXAMPLE_CHAT",
+                        )
+                    self.assertIn("最终续期码表单", texts[-1])
+                    self.assertIn("控件仍未就绪", texts[-1])
+                    namespace["notify"](
+                        dict(
+                            success=False,
+                            public_reason="renewal_unverified",
+                            message="续期结果待核实",
+                        ),
+                        "+1-5550001234",
+                        tg_token="EXAMPLE_TOKEN",
+                        tg_chat="EXAMPLE_CHAT",
+                    )
+                    self.assertIn("⚠️ 续期结果待核实", texts[-1])
+                    self.assertNotIn("❌ 续期失败", texts[-1])
+                else:
+                    self.assertNotIn("重试操作", texts[0])
 
 
 if __name__ == "__main__":

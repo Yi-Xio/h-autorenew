@@ -1,15 +1,23 @@
 """按现有业务顺序执行单台 Hax VPS 的续期。"""
 
 import re
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from scripts.hax_renewal import operations
+from scripts.hax_renewal.retry_report import (
+    RetryAttempt,
+    RetryStep,
+    ValidationPage,
+    retry_count,
+    start_retry,
+    validation_failure_detail,
+)
+from scripts.hax_renewal.timing import require_time
 from scripts.job_summary import REASON_LABELS
-from scripts.public_report import WARP_FAILURE_REASONS, record_check
+from scripts.public_report import WARP_FAILURE_REASONS, latest_check, record_check
 from scripts.web_sessions import AuthenticationError
 
 CN_TZ = timezone(timedelta(hours=8))
@@ -52,11 +60,9 @@ class RenewalServices:
     prepare_initial_page: Callable[[Any], None]
     check_initial_form: Callable[[Any, int], None]
     ensure_warp_ready: Callable[[], None]
-    restart_warp: Callable[[], bool]
     handoff_to_warp: Callable[[Any, str | None], bool]
     prepare_warp_page: Callable[[Any, int, str, str | None], None]
     prepare_final_form: Callable[[Any, int, str, str | None], bool]
-    refresh_code_page: Callable[[Any, int, str, str | None], bool]
     clean_page: Callable[[Any], None]
     capture: Callable[[Any, int, str], None]
     read_vps_info: Callable[[Any, int], tuple[list[dict[str, str]], str, str | None]]
@@ -92,14 +98,9 @@ def collect_result(
     read_vps_info: Callable[[Any, int], tuple[list[dict[str, str]], str, str | None]],
 ) -> bool:
     """以本轮真实提交后的站点成功提示为主，另行核对信息页日期。"""
-    # Hax 用原生 alert 显示结果；先处理它，避免阻塞后续页面操作。
     # 观察器在最终按钮点击前启用，只保留本轮提示的分类和日期。
-    try:
-        operations.drain_result_alerts(browser)
-    except Exception as e:
-        print(f"  [WARN] 处理弹窗异常: {type(e).__name__}: {e}")
-    feedback, attempted = operations.read_submission_feedback(browser)
-
+    feedback, tracked = operations.read_submission_feedback(browser)
+    attempted = bool(result.get("submission_attempted") or tracked)
     result["feedback_status"] = feedback["status"]
     result["submission_attempted"] = attempted
     confirmed = feedback["status"] == "success"
@@ -124,7 +125,13 @@ def collect_result(
         result["message"] = messages[feedback["reason"]]
         if feedback["reason"] == "captcha":
             record_check("captcha", "site_feedback", "rejected")
-        result["detailMessage"] = ""
+        result["detailMessage"] = (
+            validation_failure_detail(
+                ValidationPage.CODE_FORM, {"step": "site_feedback", "result": "rejected"}
+            )
+            if feedback["reason"] == "captcha"
+            else ""
+        )
         result["public_reason"] = (
             "renewal_unverified"
             if attempted and feedback["status"] == "unknown"
@@ -144,6 +151,94 @@ def collect_result(
     return confirmed
 
 
+def _prepare_initial_form(browser: Any, services: RenewalServices) -> None:
+    """为请求续期码准备普通表单，页面检查与字段操作共用一次重开。"""
+    for attempt in range(2):
+        require_time()
+        retry = start_retry(RetryStep.INITIAL_FORM) if attempt else None
+        try:
+            operations.open_renewal_form(browser)
+            services.prepare_initial_page(browser)
+            operations.fill_site_address(browser)
+            operations.accept_agreement(browser)
+            if retry:
+                retry.recovered = True
+            return
+        except (CaptchaBlocked, TimeoutError):
+            raise
+        except AuthenticationError as error:
+            if error.reason != "hax_page_unverified":
+                raise
+        except Exception:
+            pass
+        current = browser.get_current_url()
+        if operations.is_hax_url(current, "/login"):
+            raise AuthenticationError("hax_session_invalid")
+        if attempt or not operations.is_hax_url(current):
+            raise AuthenticationError("hax_page_unverified")
+    raise AuthenticationError("hax_page_unverified")
+
+
+def _request_code(browser: Any, result: dict[str, Any]) -> RetryAttempt | None:
+    """请求可能已发出时，后续只处理本次响应。"""
+    for attempt in range(2):
+        require_time()
+        # 记录业务消息基线，不使用历史消息或操作 Telegram 按钮。
+        browser.telegram_reader.arm()
+        require_time()
+        retry = start_retry(RetryStep.CODE_REQUEST) if attempt else None
+        result["code_request_pending"] = True
+        try:
+            attempted = operations.click_code_request(browser)
+        except Exception:
+            # 浏览器可能在点击实际执行以后丢失响应。
+            return retry
+        if attempted:
+            return retry
+        result["code_request_pending"] = False
+    raise AuthenticationError("renewal_code_unavailable")
+
+
+def _open_code_page(browser: Any, link: str) -> None:
+    """只从本轮已核对的入口重开码页，保留续期码请求。"""
+    for attempt in range(2):
+        require_time()
+        retry = start_retry(RetryStep.CODE_PAGE) if attempt else None
+        try:
+            operations.open_code_page(browser, link)
+        except Exception:
+            pass
+        if operations.wait_for_code_page(browser):
+            if retry:
+                retry.recovered = True
+            return
+        require_time()
+        current = browser.get_current_url()
+        if attempt or not (
+            operations.can_reopen_hax_page(current, link)
+            or operations.is_hax_url(current, "/vps-renew")
+        ):
+            break
+    raise AuthenticationError("hax_page_unverified")
+
+
+def _check_site_validation(
+    result: dict[str, Any],
+    page: ValidationPage,
+    check: Callable[[], bool | None],
+) -> bool | None:
+    """让本次失败只使用当前验证步骤产生的诊断。"""
+    previous = latest_check("captcha")
+    try:
+        return check()
+    except CaptchaBlocked:
+        current = latest_check("captcha")
+        result["detailMessage"] = validation_failure_detail(
+            page, current if current is not previous else None
+        )
+        raise
+
+
 def _try_final_submission(
     browser: Any,
     code: str,
@@ -151,66 +246,41 @@ def _try_final_submission(
     sid_f: str,
     proxy: str | None,
     services: RenewalServices,
+    result: dict[str, Any],
 ) -> None:
-    """准备最终表单并发起提交，结果由调用方读取。"""
-    if not services.prepare_final_form(browser, idx, sid_f, proxy):
-        return
-
+    """完成表单准备，只有尚未尝试点击时才能恢复按钮操作。"""
+    require_time()
+    if not _check_site_validation(
+        result,
+        ValidationPage.CODE_FORM,
+        lambda: services.prepare_final_form(browser, idx, sid_f, proxy),
+    ):
+        raise AuthenticationError("hax_page_unverified")
     operations.fill_renewal_code(browser, code)
     operations.position_final_form(browser)
     services.capture(browser, idx, f"renew_{sid_f}_complete_code")
 
-    # 只用真实鼠标点击（用户实证：之前跑出进度条的成功轮次就是真实点击）。
-    # 不做任何 JS click / XHR POST / form.submit 兜底——那些反而绕过了
-    # 网站对「真人交互」的判定，导致 POST 被服务器无视。
-    try:
-        # 点击前：滚动按钮到视口中央 + 清理广告浮层（含 24h 看广告弹窗）
-        services.clean_page(browser)
-        operations.align_final_button(browser)
-        operations.observe_submission(browser)
-        operations.click_final_button(browser)
-    except Exception as e:
-        print(f"  [ERROR] 续期的最终按钮点击出错: {e}")
-
-    # 点击后 3 秒截提交结果页，再由外层继续等待并跳转 info。
-    time.sleep(3)
-    services.capture(browser, idx, f"renew_{sid_f}_after_final_submit")
-
-
-def _submit_and_check(
-    browser: Any,
-    code: str,
-    idx: int,
-    sid_f: str,
-    old_valid_until: str,
-    proxy: str | None,
-    result: dict[str, Any],
-    services: RenewalServices,
-    max_warp_retries: int,
-) -> None:
-    """按现有条件提交并读取结果，保留站点明确拒绝时的恢复分支。"""
-    for code_attempt in range(1, max_warp_retries + 1):
-        # 5a. 提交验证码页面（算术 + reCAPTCHA + 最终提交）
-        _try_final_submission(browser, code, idx, sid_f, proxy, services)
-
-        # 5b. 检查续期结果
-        if collect_result(browser, result, old_valid_until, services.read_vps_info):
-            break  # 成功，退出
-
-        # captcha 错误时，刷新 vps-renew-code 页面重试
-        resp_msg = result.get("message", "")
-        if "captcha" in resp_msg.lower() and code_attempt < max_warp_retries:
-            print(
-                f"  [INFO] captcha 错误，换 WARP IP 后重试 ({code_attempt}/{max_warp_retries})..."
-            )
-            if services.refresh_code_page(browser, idx, sid_f, proxy):
-                continue  # 新 IP + 新验证码页面后重试本轮最终提交
-            result["public_reason"] = "warp_failed"
-            result["message"] = "续期失败: captcha 被服务器拒绝，WARP 换 IP 失败"
-            result["detailMessage"] = "captcha 被服务器拒绝，WARP 换 IP 失败"
-            break
-
-        break  # 非 captcha 错误或重试耗尽，退出内层循环
+    # 滚动按钮到视口中央并清理广告浮层，随后启用反馈观察。
+    services.clean_page(browser)
+    for attempt in range(2):
+        require_time()
+        retry = start_retry(RetryStep.FINAL_BUTTON) if attempt else None
+        try:
+            operations.align_final_button(browser)
+            operations.observe_submission(browser)
+            if operations.click_final_button(browser):
+                result["submission_attempted"] = True
+                if retry:
+                    retry.recovered = True
+                return
+        except (AuthenticationError, TimeoutError):
+            raise
+        except Exception:
+            pass
+        finally:
+            if not result["submission_attempted"]:
+                operations.close_submission(browser)
+    raise AuthenticationError("hax_page_unverified")
 
 
 def run_renewal(
@@ -221,9 +291,7 @@ def run_renewal(
     proxy: str | None,
     *,
     services: RenewalServices,
-    min_valid_days: int,
-    max_renew_retries: int,
-    max_warp_retries: int,
+    min_valid_days: int | None,
 ) -> dict[str, Any]:
     """按当前业务规则续期一台 VPS，返回供账号入口汇总和通知的结果。"""
     sid = server_info.get("id", "")
@@ -234,7 +302,11 @@ def run_renewal(
     # ── 到期日充足判断：剩余天数 ≥ min_valid_days 时跳过续期 ──────────
     valid_date = _parse_iso_date(old_valid_until)
     base_date = _parse_iso_date(server_info.get("current_date", "")) or cn_now().date()
-    if valid_date is not None and (valid_date - base_date).days >= min_valid_days:
+    if (
+        min_valid_days is not None
+        and valid_date is not None
+        and (valid_date - base_date).days >= min_valid_days
+    ):
         days_left = (valid_date - base_date).days
         result = {
             "server_id": sid,
@@ -265,7 +337,8 @@ def run_renewal(
         print(f"{'─' * 40}")
         return result
 
-    # 记录本次续期过程中的换 IP 次数、warp 刷新次数与外层重试次数
+    # 记录本次续期过程中的 WARP 统计和局部恢复次数。
+    prior_retries = retry_count()
     warp = services.warp_counters()
     warp.current_tag = phone_mask
     warp_start = warp.rotation_count
@@ -280,6 +353,9 @@ def run_renewal(
         "location": server_info.get("location", ""),
         "phoneMask": phone_mask,
         "success": False,
+        "submission_attempted": False,
+        "feedback_status": "unknown",
+        "code_request_pending": False,
         "message": "",
         "detailMessage": "",
         "screenshot": None,
@@ -288,9 +364,14 @@ def run_renewal(
         "retry_count": 0,
         "old_valid_until": old_valid_until,
         "new_valid_until": "",
-        "vps_info_screenshot": server_info.get("vps_info_screenshot", ""),
+        "vps_info_screenshot": "",
         "_idx": idx,
     }
+
+    if valid_date is None:
+        result["public_reason"] = "vps_read_failed"
+        result["message"] = "未能读取有效的 VPS 到期日"
+        return result
 
     sid_f = re.sub(r"[^\w]", "_", sid)
 
@@ -298,126 +379,68 @@ def run_renewal(
     print(f"  [INFO] 续期: {server_name} (id={safe_sid_for_filename(sid)})")
     print(f"{'─' * 40}")
 
-    # 算术验证码失败时额外保留一次换 IP 重试机会。
-    max_attempts = max_renew_retries + 1
-    forced_arithmetic_retry_used = False
-    for renew_attempt in range(1, max_attempts + 1):
-        # 重试时清除上一轮的截图和日期，避免把旧页面当作本次最终结果。
-        result["screenshot"] = None
-        result["vps_info_screenshot"] = ""
-        result["info_valid_until"] = ""
-        result["feedback_status"] = "unknown"
-        result["submission_attempted"] = False
-        if renew_attempt > 1:
-            print(f"  [INFO] 续期重试 {renew_attempt}/{max_renew_retries}...")
+    try:
+        _prepare_initial_form(browser, services)
+        _check_site_validation(
+            result,
+            ValidationPage.INITIAL_FORM,
+            lambda: services.check_initial_form(browser, idx),
+        )
+        services.capture(browser, idx, f"renew_{sid_f}_before_submit")
+        code_retry = _request_code(browser, result)
+        link = operations.wait_for_code_link(browser)
+        if code_retry:
+            code_retry.recovered = True
+        _open_code_page(browser, link)
+        operations.position_code_form(browser)
 
-        result["public_reason"] = "renewal_failed"
+        # 初始请求可经代理完成，后续码页仍使用原有的 WARP 连接。
+        require_time()
         try:
-            # 提交之前记录业务消息基线；不使用历史旧码或操作 Telegram 按钮。
-            browser.telegram_reader.arm()
-            operations.open_renewal_form(browser)
-            services.prepare_initial_page(browser)
-            operations.fill_site_address(browser)
-            operations.accept_agreement(browser)
-            services.check_initial_form(browser, idx)
-            # 提交（点击 Renew VPS 按钮）
-            services.capture(browser, idx, f"renew_{sid_f}_before_submit")
-            operations.click_code_request(browser)
-            time.sleep(5)
-            services.capture(browser, idx, f"renew_{sid_f}_after_submit")
+            services.ensure_warp_ready()
+        except WarpError as error:
+            if error.reason != "warp_ip_query_failed":
+                raise
+            require_time()
+            retry = start_retry(RetryStep.WARP_CHECK)
+            services.ensure_warp_ready()
+            retry.recovered = True
+        require_time()
+        if not services.handoff_to_warp(browser, link):
+            raise WarpError("warp_failed")
+        _check_site_validation(
+            result,
+            ValidationPage.CODE_FORM,
+            lambda: services.prepare_warp_page(browser, idx, sid_f, proxy),
+        )
 
-            # 进入码页，站点验证在浏览器交接后处理。
-            link_info = operations.wait_for_code_link(browser)
-            before_url = operations.open_code_page(browser, link_info)
-            operations.wait_for_code_page(browser, before_url)
-            operations.position_code_form(browser)
-
-            # 4. 最终续期页面强制脱离 sing-box，改由系统 WARP 直连。
-            # 入口点击可通过代理完成，但验证码和最后提交必须使用同一 WARP 出口。
-            print("  [INFO] 已进入最终续期页面，切换为 WARP 直连浏览器...")
-            if renew_attempt == 1:
-                services.ensure_warp_ready()
-            else:
-                services.restart_warp()
-            if not services.handoff_to_warp(browser, operations.HAX_VPS_RENEW_CODE_URL):
-                result["public_reason"] = "warp_failed"
-                raise CaptchaBlocked("最终续期页面 WARP 直连浏览器重建失败")
-
-            services.prepare_warp_page(browser, idx, sid_f, proxy)
-
-            # 5. 获取 TG 验证码
-            result["public_reason"] = "renewal_code_unavailable"
-            # 从固定业务会话等待本轮新码，不输出验证码。
-            code = browser.telegram_reader.wait_for_code(timeout=150)
+        # 业务码基线随本轮请求保留，WARP 浏览器重建不会重置它。
+        require_time()
+        code = browser.telegram_reader.wait_for_code(timeout=150)
+        result["code_request_pending"] = False
+        _try_final_submission(browser, code, idx, sid_f, proxy, services, result)
+        collect_result(browser, result, old_valid_until, services.read_vps_info)
+    except Exception as error:
+        if result["success"]:
+            # 保存已核实的业务结果；信息页和截图异常独立收尾。
+            print("  [WARN] 未能补充 VPS 信息")
+        elif result["submission_attempted"]:
+            result["public_reason"] = "renewal_unverified"
+        elif isinstance(error, (AuthenticationError, WarpError)):
+            result["public_reason"] = error.reason
+        elif isinstance(error, CaptchaBlocked):
+            result["public_reason"] = "captcha_failed"
+        elif isinstance(error, TimeoutError):
+            result["public_reason"] = "timeout"
+        else:
             result["public_reason"] = "renewal_failed"
+        if not result["success"]:
+            result["message"] = REASON_LABELS[result["public_reason"]]
+            print(f"  [WARN] 续期操作中止: {type(error).__name__}")
 
-            _submit_and_check(
-                browser,
-                code,
-                idx,
-                sid_f,
-                old_valid_until,
-                proxy,
-                result,
-                services,
-                max_warp_retries,
-            )
-
-            if result["success"]:
-                break  # 成功，退出外层重试
-
-            if renew_attempt < max_renew_retries:
-                print("  [INFO] 等待 5s 后重试...")
-                time.sleep(5)
-                continue
-            break
-
-        except WarpError as e:
-            result["public_reason"] = e.reason
-            result["message"] = str(e)
-            break
-        except AuthenticationError as e:
-            result["public_reason"] = e.reason
-            result["message"] = REASON_LABELS[e.reason]
-            break
-        except CaptchaBlocked as e:
-            # 保留验证码失败的具体环节，不由异常类型推断出口被封锁。
-            # 此处保留已有恢复调用；验证码失败类型与换出口条件由后续重试改造统一。
-            # 算术验证码即使到达普通重试上限，也额外保留一次 WARP 重试。
-            is_arithmetic_failure = isinstance(e, ArithmeticCaptchaUnavailable)
-            can_retry = renew_attempt < max_renew_retries
-            if is_arithmetic_failure and not forced_arithmetic_retry_used:
-                can_retry = True
-                forced_arithmetic_retry_used = True
-            if can_retry:
-                print(f"  [WARN] {type(e).__name__}: {e}")
-                print("  [INFO] 验证码失败，立即切换 WARP IP 后重试...")
-                try:
-                    if services.restart_warp() and services.handoff_to_warp(
-                        browser, None
-                    ):
-                        time.sleep(5)
-                        continue
-                except WarpError as warp_error:
-                    result["public_reason"] = warp_error.reason
-                    result["message"] = str(warp_error)
-                    break
-            if result.get("public_reason") != "warp_failed":
-                result["public_reason"] = "captcha_failed"
-            result["message"] = f"验证码失败: {e}"
-            break
-        except Exception as e:
-            print(f"  [ERROR] 续期异常: {e}")
-            if renew_attempt < max_renew_retries:
-                print("  [INFO] 等待 5s 后重试...")
-                time.sleep(5)
-                continue
-            result["message"] = f"续期异常: {e}"
-            break
-
+    result["retry_count"] = retry_count() - prior_retries
     result["warp_swaps"] = warp.rotation_count - warp_start
     result["warp_refresh"] = warp.warp_refresh_count - warp_refresh_start
-    result["retry_count"] = max(renew_attempt - 1, 0)
     print(
         f"  [STATS][{result.get('phoneMask', '')}] 续期重试={result['retry_count']} ip更换={result['warp_swaps']} warp刷新={result['warp_refresh']}"
     )

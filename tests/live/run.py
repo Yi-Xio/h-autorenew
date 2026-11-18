@@ -28,6 +28,8 @@ from scripts.web_sessions import MAX_SESSION_BYTES, load_private_json, save_priv
 from setup_web_sessions import SessionParser
 
 ROOT = Path(__file__).resolve().parents[2]
+ACCOUNT_TIMEOUT_SECONDS = 1200
+RUNTIME_TIMEOUT_SECONDS = ACCOUNT_TIMEOUT_SECONDS + 40
 
 
 def import_configuration(source: Path, private: Path, owner: int) -> dict[str, str]:
@@ -68,8 +70,13 @@ def import_configuration(source: Path, private: Path, owner: int) -> dict[str, s
         with target.open("xb") as output:
             output.write(raw)
         target.chmod(0o600)
-        load_private_json(target)
-        environment[name + "_FILE"] = str(target)
+        value = load_private_json(target)
+        if name == "RENEWAL_ACCOUNTS":
+            environment[name] = json.dumps(value, separators=(",", ":"))
+        elif isinstance(value, str):
+            environment[name] = value
+        else:
+            raise ValueError("invalid_notification")
     configured_accounts(environment)
     notification_config(environment)
     return environment
@@ -166,11 +173,12 @@ def run_account(
     identity: str,
     index: int,
     mode: str,
-    input_mode: str,
     destination: Path,
     state_directory: Path,
+    *,
+    force: bool = False,
 ) -> int:
-    """每个账号独立恢复和保存状态；全流程必须真正提交成功。"""
+    """按所选命令执行一个账号，为本轮保存独立的回执。"""
     matches = [
         account
         for account in configured_accounts(environment)
@@ -183,25 +191,17 @@ def run_account(
         RENEWAL_ACCOUNT_KEY=cache_identity(matches[0]),
         BATCH_ACCOUNT_INDEX=str(index),
         PUBLIC_SUMMARY_DEFERRED="1",
-        PUBLIC_RUN_TIMEOUT_SECONDS="900",
+        PUBLIC_RUN_TIMEOUT_SECONDS=str(ACCOUNT_TIMEOUT_SECONDS),
         PUBLIC_HEARTBEAT_SECONDS="15",
         SKIP_DAYS="5",
         HAX_MIN_VALID_DAYS="5",
-        MAX_RENEW_RETRIES="0",
-        MAX_WARP_RETRIES="1",
         MAX_WARP_ROTATE_ATTEMPTS="3",
         DEBUG_FLAG="0",
     )
     env.pop("RENEWAL_ACCOUNT_ID", None)
-    if input_mode == "actions":
-        for name in ("RENEWAL_ACCOUNTS", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
-            value = load_private_json(Path(env.pop(name + "_FILE")))
-            if name != "RENEWAL_ACCOUNTS" and not isinstance(value, str):
-                raise ValueError("invalid_notification")
-            if name == "RENEWAL_ACCOUNTS":
-                env[name] = json.dumps(value, separators=(",", ":"))
-            elif isinstance(value, str):
-                env[name] = value
+    env.pop("HAX_FORCE_RENEWAL", None)
+    if force:
+        env["HAX_FORCE_RENEWAL"] = "1"
     destination.mkdir(mode=0o700, parents=True)
     env.update(
         GITHUB_OUTPUT=str(destination / "step-output.txt"),
@@ -211,17 +211,20 @@ def run_account(
         version=1,
         mode=mode,
         account_identifier=identity,
-        input=input_mode,
+        input="actions",
+        force=force,
         github_cache_uploaded=False,
         result="failed",
         validation="failed",
         reason="local_validation_failed",
     )
     try:
-        if mode == "readonly":
+        if mode == "check-auth":
             # 与正式续期使用同一 WARP 准备步骤，避免直连通过被误当作正式环境可用。
             connect_warp()
-            code = invoke("scripts.actions_runtime", ["hax", "--check-auth"], env, 940)
+            code = invoke(
+                "scripts.actions_runtime", ["hax", "--check-auth"], env, RUNTIME_TIMEOUT_SECONDS
+            )
             authentication = validate_authentication_result(
                 json.loads((ROOT / AUTHENTICATION_FILE).read_text())
             )
@@ -237,32 +240,32 @@ def run_account(
                 checks=authentication["checks"],
             )
             return code
-        code, keys = workflow("setup-cache", env)
+        code, _ = workflow("setup-cache", env)
         if code:
             raise ValueError("configuration_failed")
         fields = runtime_account("hax", env, with_notification=False)
         opaque = public_account_id("hax", fields)
         cached = state_directory / (opaque + ".json")
-        # 真实完整续期显式冷启动；policy 模式才恢复本地缓存并遵守默认门槛。
-        if mode == "policy" and cached.exists():
-            info = cached.lstat()
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError("unsafe_cache")
-            with cached.open("rb") as source:
-                raw = source.read(4097)
-            # 损坏或过大的缓存交给正式预筛判定为 invalid，再回到网站检查。
-            (ROOT / CACHE_FILE).write_bytes(raw)
-        code, decision = workflow("check", env)
-        if code:
-            raise ValueError("cache_check_failed")
+        if force:
+            decision = {"should_run": "true", "cache_status": "forced"}
+        else:
+            if cached.exists():
+                info = cached.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("unsafe_cache")
+                with cached.open("rb") as source:
+                    raw = source.read(4097)
+                # 损坏或过大的缓存交给正式预筛判定为 invalid，再回到网站检查。
+                (ROOT / CACHE_FILE).write_bytes(raw)
+            code, decision = workflow("check", env)
+            if code:
+                raise ValueError("cache_check_failed")
         should_run = decision.get("should_run") == "true"
-        if mode == "renew":
-            env["HAX_MIN_VALID_DAYS"] = "366"
         state = {}
         code = 0
         if should_run:
             connect_warp()
-            code = invoke("scripts.actions_runtime", ["hax"], env, 940)
+            code = invoke("scripts.actions_runtime", ["hax"], env, RUNTIME_TIMEOUT_SECONDS)
             receipt["renewal_exit_code"] = code
             state_code, state = workflow("prepare-state", env)
             if state_code:
@@ -327,7 +330,7 @@ def run_account(
                 receipt["checks"] = details["checks"]
             if details["text_failed"] or details["photo_failed"]:
                 code = 1
-            if mode == "renew" and (
+            if force and (
                 not counters
                 or counters["renewed"] < 1
                 or counters["failed"]
@@ -394,19 +397,24 @@ def main(arguments: list[str] | None = None) -> int:
     def cancelled(signum: int, frame: object) -> None:
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, cancelled)
     try:
-        parser = SessionParser(description="Docker 内真实 Hax 验证，默认实际执行续期。")
-        parser.add_argument(
-            "--mode", choices=("renew", "readonly", "policy"), default="renew"
-        )
-        parser.add_argument(
-            "--account-identifier",
-            action="append",
-            help="按原文选择账号标识符，可重复指定",
-        )
-        parser.add_argument("--input", choices=("file", "actions"), default="file")
+        parser = SessionParser(description="在 Docker 中验证 Hax 续期和登录。", allow_abbrev=False)
+        commands = parser.add_subparsers(dest="command")
+        renew = commands.add_parser("renew", help="按生产策略运行一次续期任务", allow_abbrev=False)
+        renew.add_argument("--force", action="store_true", help="跳过本地到期判断，实测续期")
+        check_auth = commands.add_parser("check-auth", help="检查已保存的登录凭据", allow_abbrev=False)
+        check_auth.set_defaults(force=False)
+        for command in (renew, check_auth):
+            command.add_argument(
+                "--account-identifier",
+                action="append",
+                help="按原文选择账号标识符，可重复指定",
+            )
         args = parser.parse_args(arguments)
+        if args.command is None:
+            parser.print_help()
+            return 0
+        signal.signal(signal.SIGTERM, cancelled)
         with tempfile.TemporaryDirectory(prefix="hax-live-") as temporary:
             env = import_configuration(
                 Path("/mnt/hax-secrets"),
@@ -427,30 +435,15 @@ def main(arguments: list[str] | None = None) -> int:
                         env,
                         account["id"],
                         index,
-                        args.mode,
-                        args.input,
+                        args.command,
                         Path("/mnt/hax-results")
                         / stamp
                         / identifier_directory(account["id"]),
                         Path("/mnt/hax-state"),
+                        force=args.force,
                     )
                     if result != 0:
                         exit_code = 1
-                    if args.mode == "renew" and result == 0:
-                        # 用相同原始凭据和全新浏览器再次检查，不能靠本轮 Cookie 证明可复用。
-                        reuse = run_account(
-                            env,
-                            account["id"],
-                            index,
-                            "readonly",
-                            "actions" if args.input == "file" else "file",
-                            Path("/mnt/hax-results")
-                            / stamp
-                            / (identifier_directory(account["id"]) + "-reuse"),
-                            Path("/mnt/hax-state"),
-                        )
-                        if reuse != 0:
-                            exit_code = 1
             return exit_code
     except KeyboardInterrupt:
         print("result=cancelled category=local_validation_cancelled")

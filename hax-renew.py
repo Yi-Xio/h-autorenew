@@ -12,6 +12,7 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 from gen_singbox_config import setup_proxy
 from scripts.public_report import (
     authentication_result,
+    iso_date as public_expiry_valid,
     publish_progress,
     publish_results,
     record_check,
@@ -34,7 +35,15 @@ from scripts.hax_renewal.flow import (
     run_renewal,
     safe_sid_for_filename,
 )
-from scripts.hax_renewal.operations import HAX_VPS_RENEW_CODE_URL
+from scripts.hax_renewal.operations import HAX_VPS_RENEW_URL, can_reopen_hax_page, is_hax_url
+from scripts.hax_renewal.retry_report import (
+    RetryStep,
+    format_retry_report,
+    retry_count,
+    retry_scope,
+    start_retry,
+)
+from scripts.hax_renewal.timing import remaining_time, require_time
 from scripts.hax_result import RenewalFeedback
 from scripts.job_summary import REASON_HINTS, REASON_LABELS
 
@@ -60,45 +69,19 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 环境变量（均可通过 workflow yml / shell 覆盖）
 #
-# 重试分三层，关系是"调用"关系：外层每轮 → 中层每次换IP → 内层多轮重注册。
-#
-#   外层 MAX_RENEW_RETRIES
-#     整个续期流程（登录→进页面→解验证码→提交）失败后整体重跑几次。
-#     每次重跑都会重新登录、重新等 TG 验证码。
-#
-#   中层 MAX_WARP_RETRIES
-#     提交验证码后服务器报 captcha 错误时，"换 IP → 重新提交"的循环次数。
-#     每一次循环都会调用一次 restart_warp() 触发内层轮换。
-#
-#   内层 MAX_WARP_ROTATE_ATTEMPTS
-#     上面那一次 restart_warp() 内部，warp-cli 重注册的轮数
-#     （对应日志"轮换尝试 x/N"）。Cloudflare 立即重注册常返回同一出口 IP，
-#     所以每轮之间递增等待 5/10/15/20s 再试。
-#     ★ 20 轮都拿不到新 IP → 本次换 IP 失败 → 中层本轮直接终止，
-#       以固定 WARP 原因停止本次续期，不用原出口继续提交。
-#
-# 时序示例（MAX_WARP_RETRIES=10, MAX_WARP_ROTATE_ATTEMPTS=20）：
-#   提交验证码 → 被拒 → 换IP(内部最多20轮重注册)
-#     ├─ 第3轮拿到新IP → 用新IP重新提交（内层只消耗了3轮）
-#     └─ 20轮全是重复IP → 未取得新出口 → 停止本次续期
-# ════════════════════════════════════════════════════════════════════
 # Hax 仅通过受控入口传入单账号 Web 会话，不再使用六字段 BATCH。
-# 【外层】每个续期 URL 的整体流程重试次数（实际执行 = 该值 + 1 次）
-MAX_RENEW_RETRIES_PER_URL = int(os.environ.get("MAX_RENEW_RETRIES", "5").strip())
-# 【中层】提交验证码后被服务器以 captcha 错误拒绝时，"换 WARP IP → 重新提交"
-# 的循环次数。每循环一次就触发一次下面的内层轮换。
-MAX_WARP_RETRIES = int(os.environ.get("MAX_WARP_RETRIES", "20").strip())
-# 【内层】单次换 IP 内部的 warp-cli 重注册轮数。
-# Cloudflare 立即重注册往往返回同一出口 IP，因此每轮之间递增等待 5/10/15/20s；
-# 全部轮次都拿不到新 IP 时本次换 IP 失败，向上抛 WarpError，
-# 不再用未满足换出口要求的网络继续本次续期。
+# WARP 连接恢复和出口查询继续使用原有有限尝试。
 MAX_WARP_ROTATE_ATTEMPTS = int(os.environ.get("MAX_WARP_ROTATE_ATTEMPTS", "20").strip())
 # 单条 warp-cli 命令的超时秒数（正常执行 1-2s；超时说明网络已断/挂起，
 # 会强杀整个进程组防止孤儿 warp-cli 卡住管道，然后由轮换循环继续下一轮）
 WARP_CMD_TIMEOUT = int(os.environ.get("WARP_CMD_TIMEOUT", "10").strip())
 # 【到期日门槛】VPS 剩余有效期 ≥ 该天数时跳过续期流程，只提示"有效期充足，
 # 无需续期"。默认 5 天，可通过环境变量 HAX_MIN_VALID_DAYS 调整。
-MIN_VALID_DAYS = int(os.environ.get("HAX_MIN_VALID_DAYS", "5").strip())
+MIN_VALID_DAYS = (
+    None
+    if os.environ.get("HAX_FORCE_RENEWAL") == "1"
+    else int(os.environ.get("HAX_MIN_VALID_DAYS", "5").strip())
+)
 
 DEBUG = os.environ.get("DEBUG_FLAG", "0").strip() == "1"
 
@@ -125,7 +108,8 @@ class _DPContext:
     def __init__(self, page, frame=None): self.page, self.frame = page, frame
     def ele(self, loc, timeout=3): return (self.frame or self.page).ele(loc, timeout=timeout)
     def eles(self, loc, timeout=3): return (self.frame or self.page).eles(loc, timeout=timeout) or []
-    def run_js(self, script, *args): return (self.frame or self.page).run_js(script, *args)
+    def run_js(self, script, *args, timeout=None):
+        return (self.frame or self.page).run_js(script, *args, timeout=timeout)
 
 class _DPSwitch:
     def __init__(self, driver): self.driver = driver
@@ -187,14 +171,14 @@ class DPBrowser:
     def set_active(self, handle):
         self.page.activate_tab(handle)
         self.active = self.page.get_tab(handle)
-    def open(self, url):
+    def open(self, url, *, timeout=30):
         self.active = self.page
         self.driver.switch_to.default_content()
-        return self.page.get(url)
+        return self.page.get(url, retry=0, timeout=require_time(min(30, timeout)))
     def execute_script(self, script, *args):
         m=re.fullmatch(r"\s*return document\.querySelector\((['\"])(.*?)\1\)\s*;?\s*",script,re.S)
-        if m: return self.active.ele(f'css:{m.group(2)}', timeout=3)
-        return self.driver._context.run_js(script, *args)
+        if m: return self.active.ele(f'css:{m.group(2)}', timeout=require_time(3))
+        return self.driver._context.run_js(script, *args, timeout=require_time(30))
     def get_current_url(self): return self.active.url or ''
     def get_title(self): return self.active.title or ''
     def get_page_source(self): return self.active.html or ''
@@ -1217,14 +1201,15 @@ def notify(result: dict, username: str, tg_token: str = None, tg_chat: str = Non
                 if ipv6:
                     text += f"🌐 IPv6: {ipv6}\n"
                 swaps = result.get("warp_swaps", 0)
-                retries = result.get("retry_count", 0)
                 refresh = result.get("warp_refresh", 0)
-                text += f"\n🔥 重试次数: {retries}\n🌐 ip更换次数: {swaps}\n⚡ warp刷新次数: {refresh}\n"
+                text += f"\n🌐 ip更换次数: {swaps}\n⚡ warp刷新次数: {refresh}\n"
         else:
+            unverified = result.get("public_reason") == "renewal_unverified"
+            renewal_status = "⚠️ 续期结果待核实" if unverified else "❌ 续期失败"
             text = (
                 f"<b>🎮 {HAX_TITLE} 续期报告</b>\n"
                 f"{header}"
-                f"❌ 续期失败\n"
+                f"{renewal_status}\n"
                 f"🖥️ 服务器: {hostname}\n"
                 f"📍 位置: {location}\n"
                 f"📊 状态: {status}\n"
@@ -1238,17 +1223,16 @@ def notify(result: dict, username: str, tg_token: str = None, tg_chat: str = Non
             if ipv6:
                 text += f"🌐 IPv6: {ipv6}\n"
             swaps = result.get("warp_swaps", 0)
-            retries = result.get("retry_count", 0)
             refresh = result.get("warp_refresh", 0)
-            text += f"\n🔥 重试次数: {retries}\n🌐 ip更换次数: {swaps}\n⚡ warp刷新次数: {refresh}\n"
-            if msg:
+            text += f"\n🌐 ip更换次数: {swaps}\n⚡ warp刷新次数: {refresh}\n"
+            if msg and not unverified:
                 text += f"❗ 错误: {msg}\n"
             detail = result.get("detailMessage", "")
             if detail:
                 text += f"📎 详情: {detail}\n"
         if server_online:
             text += f"🌐 {server_online}\n"
-        if send_tg_message(token, chat, text):
+        if send_tg_message(token, chat, text + format_retry_report()):
             print("  [INFO] TG推送成功")
         else:
             print("  [WARN] TG推送失败")
@@ -1273,7 +1257,7 @@ def notify_provisioning(username: str, img: str = None, tg_token: str = None, tg
         )
         if img and Path(img).exists():
             send_tg_photo(token, chat, img, "🖥️ 当前 VPS 状态截图")
-        if send_tg_message(token, chat, text):
+        if send_tg_message(token, chat, text + format_retry_report()):
             print("  [INFO] TG推送成功（排队/开机中）")
         else:
             print("  [WARN] TG推送失败（排队/开机中）")
@@ -1298,7 +1282,7 @@ def notify_no_server(username: str, img: str = None, tg_token: str = None, tg_ch
         )
         if img and Path(img).exists():
             send_tg_photo(token, chat, img, "🖥️ 当前 VPS 状态截图")
-        if send_tg_message(token, chat, text):
+        if send_tg_message(token, chat, text + format_retry_report()):
             print("  [INFO] TG推送成功（无可用服务器）")
         else:
             print("  [WARN] TG推送失败（无可用服务器）")
@@ -1322,6 +1306,7 @@ def notify_login_fail(username: str, img: str = None, tg_token: str = None, tg_c
 
             f"❌ {detail}\n{hint}\n"
         )
+        text += format_retry_report()
         if img and Path(img).exists():
             send_tg_photo(token, chat, img, text)
         else:
@@ -1448,8 +1433,15 @@ def handle_recaptcha_fallback(browser, idx: int) -> bool:
 
 def hax_login_flow(browser, phone: str, idx: int, proxy: str | None = None) -> bool:
     """恢复分别手动准备的 Hax 与 Telegram Web 登录态，不自动授权。"""
+    if not remaining_time(1):
+        raise AuthenticationError("timeout")
     browser.telegram_reader = new_telegram_reader(browser.web_account["telegram_web"], proxy)
-    restore_hax(browser, browser.web_account["hax_web"])
+    if not remaining_time(1):
+        raise AuthenticationError("timeout")
+    try:
+        restore_hax(browser, browser.web_account["hax_web"])
+    except TimeoutError:
+        raise AuthenticationError("timeout") from None
     return True
 
 
@@ -1583,136 +1575,44 @@ def hax_get_vps_info(browser, idx: int) -> Tuple[List[Dict[str, str]], str, Opti
     return servers, "", screenshot
 
 
-def _prepare_final_form(browser, idx: int, sid_f: str, proxy: str | None = None,
-                        max_retries: int = 5) -> bool:
-    """
-    在 vps-renew-code 页面完成输入业务码前的检查。
+def _prepare_final_form(browser, idx: int, sid_f: str, proxy: str | None = None) -> bool:
+    """核对最终页面并完成输入业务码前的检查。"""
+    # 顺序与 auto_hax_private 参考版一致：先解 reCAPTCHA 再输入验证码。
+    try:
+        browser.driver.switch_to.default_content()
+        has_recaptcha = browser.execute_script("""
+            return (function() {
+                if (document.querySelector(".rc-anchor-container, .g-recaptcha, [data-sitekey]")) return true;
+                var iframes = document.querySelectorAll("iframe");
+                for (var i = 0; i < iframes.length; i++) {
+                    var src = iframes[i].src || "";
+                    if (src.indexOf("recaptcha") !== -1 || src.indexOf("google.com/recaptcha") !== -1) return true;
+                }
+                return false;
+            })()
+        """)
+    except Exception:
+        record_check('captcha', 'recaptcha', 'inspection_failed')
+        raise CaptchaAudioUnavailable('未能核实 reCAPTCHA 控件') from None
 
-    顺序与 auto_hax_private 参考版一致：先解 reCAPTCHA 再输入验证码。
-    CaptchaBlocked 时换 IP + 刷新页面重试，复用同一个 TG 验证码（约 3 分钟有效）。
-    重试耗尽后向上抛出 CaptchaBlocked，由外层 renew 函数处理。
-
-    Raises:
-        CaptchaBlocked: 重试耗尽仍被封锁
-    """
-    for attempt in range(1, max_retries + 1):
-        # 确保在主 frame
+    if has_recaptcha:
+        if not HAS_SPEECH:
+            record_check('captcha', 'recaptcha', 'dependency_missing')
+            raise CaptchaAudioUnavailable('语音识别依赖不可用，不提交续期')
         try:
-            browser.driver.switch_to.default_content()
+            if not RecaptchaAudioSolver(browser).solve():
+                raise CaptchaAudioUnavailable('reCAPTCHA 验证未完成，不提交续期')
+        except CaptchaBlocked:
+            raise
         except Exception:
-            pass
+            raise CaptchaAudioUnavailable('reCAPTCHA 求解异常，不提交续期') from None
 
-        # 解 reCAPTCHA（验证码输入之前解，与参考版一致）
-        print("  [INFO] 检测 reCAPTCHA...")
-        try:
-            has_recaptcha = browser.execute_script('''
-                return (function() {
-                    if (document.querySelector(".rc-anchor-container, .g-recaptcha, [data-sitekey]")) return true;
-                    var iframes = document.querySelectorAll("iframe");
-                    for (var i = 0; i < iframes.length; i++) {
-                        var src = iframes[i].src || "";
-                        if (src.indexOf("recaptcha") !== -1 || src.indexOf("google.com/recaptcha") !== -1) return true;
-                    }
-                    return false;
-                })()
-            ''')
-        except Exception as e:
-            print(f"  [WARN] reCAPTCHA 检测脚本异常: {type(e).__name__}: {e}")
-            record_check('captcha', 'recaptcha', 'inspection_failed')
-            raise CaptchaAudioUnavailable('未能核实 reCAPTCHA 控件') from None
-        print(f"  [INFO] reCAPTCHA 检测结果: {has_recaptcha}")
-
-        if has_recaptcha:
-            if HAS_SPEECH:
-                print("  [INFO] 检测到 Google reCAPTCHA，启动语音识别...")
-                try:
-                    recaptcha_solver = RecaptchaAudioSolver(browser)
-                    if recaptcha_solver.solve():
-                        print("  [INFO] ✅ reCAPTCHA 验证通过(使用的是语音识别)")
-                    else:
-                        print("  [WARN] reCAPTCHA 自动求解失败")
-                        raise CaptchaAudioUnavailable('reCAPTCHA 验证未完成，不提交续期')
-                except CaptchaBlocked as e:
-                    print(f"  [WARN] reCAPTCHA 被封锁: {e}")
-                    if attempt < max_retries:
-                        print("  [INFO] 重启 WARP 换 IP，刷新验证码页面重试...")
-                        if restart_warp() and handoff_browser_to_warp(browser):
-                            time.sleep(5)
-                        # 刷新 vps-renew-code 页面，复用 TG 验证码
-                        browser.open(HAX_VPS_RENEW_CODE_URL)
-                        time.sleep(5)
-                        # Cloudflare 绕过
-                        for cf_attempt in range(6):
-                            src = browser.get_page_source()
-                            title = (browser.get_title() or "").lower()
-                            is_cf = any(i in src for i in ["Just a moment", "Verify you are human"]) or "just a moment" in title
-                            if not is_cf:
-                                break
-                            try:
-                                browser.click_turnstile()
-                            except Exception:
-                                pass
-                            time.sleep(6)
-                        dismiss_cookie_only(browser)
-                        removeAds(browser)
-                        # 刷新后是新算术验证码，必须重新求解，否则提交必被拒
-                        try:
-                            solve_arithmetic_captcha(browser, proxy=proxy, scene="刷新后")
-                        except Exception as eA:
-                            print(f"  [WARN] 刷新后算术验证码异常: {eA}")
-                        safe_screenshot(browser, shot(idx, f"renew_{sid_f}_code_page_retry_{attempt}"))
-                        continue  # 重试验证码页面操作
-                    else:
-                        print(f"  [ERROR] 验证码页面重试已达上限 ({max_retries}次)")
-                        raise  # 被外层 CaptchaBlocked 捕获
-                except Exception as e:
-                    print(f"  [WARN] reCAPTCHA 求解异常: {e}")
-                    if attempt < max_retries:
-                        print("  [INFO] 重启 WARP 换 IP，刷新验证码页面重试...")
-                        if restart_warp() and handoff_browser_to_warp(browser):
-                            time.sleep(5)
-                        browser.open(HAX_VPS_RENEW_CODE_URL)
-                        time.sleep(5)
-                        for cf_attempt in range(6):
-                            src = browser.get_page_source()
-                            title = (browser.get_title() or "").lower()
-                            is_cf = any(i in src for i in ["Just a moment", "Verify you are human"]) or "just a moment" in title
-                            if not is_cf:
-                                break
-                            try:
-                                browser.click_turnstile()
-                            except Exception:
-                                pass
-                            time.sleep(6)
-                        dismiss_cookie_only(browser)
-                        removeAds(browser)
-                        # 刷新后是新算术验证码，必须重新求解，否则提交必被拒
-                        try:
-                            solve_arithmetic_captcha(browser, proxy=proxy, scene="刷新后")
-                        except Exception as eA:
-                            print(f"  [WARN] 刷新后算术验证码异常: {eA}")
-                        safe_screenshot(browser, shot(idx, f"renew_{sid_f}_code_page_exception_{attempt}"))
-                        continue
-                    else:
-                        print(f"  [ERROR] reCAPTCHA 求解重试已达上限 ({max_retries}次)")
-                        raise CaptchaAudioUnavailable('reCAPTCHA 求解异常，不提交续期') from None
-            else:
-                record_check('captcha', 'recaptcha', 'dependency_missing')
-                raise CaptchaAudioUnavailable('语音识别依赖不可用，不提交续期')
-
-        # 检查 浏览器会话是否仍然存活
-        try:
-            browser.driver.title
-        except Exception as e:
-            print(f"  [WARN] 浏览器会话已断开（{type(e).__name__}），跳过本次提交")
-            if attempt < max_retries:
-                time.sleep(3)
-                continue
-            else:
-                print("  [ERROR] 浏览器驱动 已断开且重试耗尽")
-                return False
-        return True
-    return False
+    # 检查浏览器会话是否仍然存活。
+    try:
+        browser.driver.title
+    except Exception:
+        return False
+    return True
 
 
 def _prepare_initial_page(browser) -> None:
@@ -1733,13 +1633,14 @@ def _prepare_initial_page(browser) -> None:
 
     dismiss_cookie_only(browser)
     removeAds(browser)
+    wait_hax_navigation(browser, HAX_VPS_RENEW_URL, timeout=20, attempt_challenge=False)
 
 
 def _check_initial_form(browser, idx: int) -> None:
     """核对初始续期表单的站点验证状态。"""
     time.sleep(2)
 
-    # 解 Turnstile：若人机验证未通过，本 IP 上提交必失败，直接换 IP 重试，避免无效提交。
+    # Turnstile 未通过时停止，避免发送无效请求。
     if not hax_handle_turnstile(browser, idx):
         raise CaptchaBlocked("renew 表单 Turnstile/人机验证未通过")
     time.sleep(2)
@@ -1748,87 +1649,94 @@ def _check_initial_form(browser, idx: int) -> None:
 def handoff_browser_to_warp(browser, target_url: Optional[str] = None) -> bool:
     """关闭带 sing-box 代理的 Chromium，重建无代理实例交给系统 WARP。"""
     old_page = browser.page
-    try:
-        cookies = old_page.cookies(all_domains=True, all_info=True)
-    except Exception as e:
-        print(f"  [WARN] 读取浏览器 cookies 失败: {type(e).__name__}: {e}")
-        cookies = []
-
-    # 只恢复 HAX 登录态，避免把第三方域 cookies 带入新实例。
+    target = target_url or HAX_BASE_URL
+    if not is_hax_url(target):
+        raise AuthenticationError("hax_page_unverified")
+    cookies = []
+    cookie_retry = None
+    for attempt in range(2):
+        require_time()
+        if attempt:
+            cookie_retry = start_retry(RetryStep.WARP_COOKIES)
+        try:
+            cookies = old_page.cookies(all_domains=True, all_info=True)
+            break
+        except Exception:
+            if attempt:
+                return False
+    # 只恢复 Hax 登录态，避免把第三方域 Cookie 带入新实例。
     cookies = [
-        c for c in (cookies or [])
-        if str(c.get('domain', '')).lower().lstrip('.') == 'hax.co.id'
+        cookie for cookie in cookies
+        if str(cookie.get('domain', '')).lower().lstrip('.') == 'hax.co.id'
     ]
+    if not cookies:
+        return False
+    if cookie_retry:
+        cookie_retry.recovered = True
     try:
         old_page.quit()
     except Exception:
         pass
 
-    new_page = None
-    try:
-        co = ChromiumOptions().auto_port()
-        co.set_argument('--no-sandbox')
-        co.set_argument('--disable-gpu')
-        co.set_argument('--disable-dev-shm-usage')
-        co.set_argument('--window-size=1920,1080')
-        new_page = ChromiumPage(co)
-        new_page.set.timeouts(page_load=30, script=30)
-        install_hax_rules(new_page)
-        block_ad_domains(new_page)
-        if cookies:
+    for attempt in range(2):
+        require_time()
+        browser_retry = start_retry(RetryStep.WARP_BROWSER) if attempt else None
+        new_page = None
+        ready = False
+        try:
+            co = ChromiumOptions().auto_port()
+            co.set_argument('--no-sandbox')
+            co.set_argument('--disable-gpu')
+            co.set_argument('--disable-dev-shm-usage')
+            co.set_argument('--window-size=1920,1080')
+            new_page = ChromiumPage(co)
+            new_page.set.timeouts(page_load=30, script=30)
+            install_hax_rules(new_page)
+            block_ad_domains(new_page)
+            # 第一次站点导航前恢复当前 Cookie，避免另建站点会话。
             new_page.set.cookies(cookies)
-        # 在第一次站点导航前恢复当前 Cookie，避免先创建另一份站点会话。
-        new_page.get(target_url or HAX_BASE_URL)
-        new_page.wait.doc_loaded()
-        time.sleep(3)
-        browser.page = new_page
-        browser.active = new_page
-        browser.driver = _DPDriver(browser)
-        wait_hax_navigation(browser, target_url or HAX_BASE_URL)
-        print(f"  [INFO] 已关闭 sing-box 代理浏览器，重建 WARP 直连浏览器（恢复 {len(cookies)} 个 HAX cookies）")
-        return True
-    except Exception as e:
-        if new_page is not None:
-            try:
-                new_page.quit(timeout=5, force=True, del_data=True)
-            except Exception:
-                pass
-        if isinstance(e, AuthenticationError):
+            browser.page = new_page
+            browser.active = new_page
+            browser.driver = _DPDriver(browser)
+            for navigation in range(2):
+                timeout = require_time(30)
+                # 仅重开本轮码页。Cookie 和 Telegram 消息基线随本轮保留。
+                page_retry = start_retry(RetryStep.WARP_CODE_PAGE) if navigation else None
+                try:
+                    new_page.get(target, retry=0, timeout=timeout)
+                except Exception:
+                    # 导航响应丢失时，先核对页面是否已经就绪。
+                    pass
+                try:
+                    wait_hax_navigation(browser, target, timeout=20, attempt_challenge=False)
+                except AuthenticationError as error:
+                    if (
+                        error.reason != "hax_page_unverified"
+                        or navigation
+                        or not can_reopen_hax_page(new_page.url, target)
+                    ):
+                        raise
+                else:
+                    if page_retry:
+                        page_retry.recovered = True
+                    break
+            ready = True
+            if browser_retry:
+                browser_retry.recovered = True
+            print("  [INFO] 已核实 WARP 浏览器中的 Hax 会话和目标页")
+            return True
+        except (AuthenticationError, TimeoutError):
             raise
-        print(f"  [ERROR] WARP 直连浏览器重建失败: {type(e).__name__}: {e}")
-        return False
-
-
-def _renew_refresh_code_page_after_captcha(browser, idx: int, sid_f: str,
-                                           proxy: str | None = None) -> bool:
-    """服务器拒绝 captcha 后换 WARP IP，并重新准备验证码页面。"""
-    print("  [INFO] 服务器拒绝 captcha，立即切换 WARP IP...")
-    restart_warp()
-    if not handoff_browser_to_warp(browser):
-        print("  [ERROR] WARP 直连浏览器重建失败，停止本次 captcha 重试")
-        return False
-
-    time.sleep(5)
-    try:
-        browser.open(HAX_VPS_RENEW_CODE_URL)
-        time.sleep(5)
-        for cf_attempt in range(6):
-            src = browser.get_page_source()
-            title = (browser.get_title() or "").lower()
-            is_cf = any(i in src for i in ["Just a moment", "Verify you are human"]) or "just a moment" in title
-            if not is_cf:
-                break
-            print(f"  [INFO] 换 IP 后处理 Cloudflare ({cf_attempt + 1}/6)...")
-            browser.click_turnstile()
-            time.sleep(6)
-        dismiss_cookie_only(browser)
-        removeAds(browser)
-        solve_arithmetic_captcha(browser, proxy=proxy, scene="换IP后")
-        safe_screenshot(browser, shot(idx, f"renew_{sid_f}_after_warp_rotate"))
-        return True
-    except Exception as e:
-        print(f"  [ERROR] 换 IP 后刷新验证码页面失败: {type(e).__name__}: {e}")
-        return False
+        except Exception:
+            if attempt or new_page is not None:
+                return False
+        finally:
+            if new_page is not None and not ready:
+                try:
+                    new_page.quit(timeout=5, force=True, del_data=True)
+                except Exception:
+                    pass
+    return False
 
 
 def _explain_failure(resp_text: str) -> str:
@@ -1870,6 +1778,7 @@ def _capture_renewal_page(browser, idx: int, name: str) -> None:
     safe_screenshot(browser, shot(idx, name))
 
 
+@retry_scope(inherit=True)
 def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
           tg_token: str = None, tg_chat: str = None, ip_info: str = "",
           proxy: str = None, phone_mask: str = "") -> Dict[str, Any]:
@@ -1878,11 +1787,9 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
         prepare_initial_page=_prepare_initial_page,
         check_initial_form=_check_initial_form,
         ensure_warp_ready=ensure_warp_ready,
-        restart_warp=restart_warp,
         handoff_to_warp=handoff_browser_to_warp,
         prepare_warp_page=_prepare_warp_page,
         prepare_final_form=_prepare_final_form,
-        refresh_code_page=_renew_refresh_code_page_after_captcha,
         clean_page=removeAds,
         capture=_capture_renewal_page,
         read_vps_info=hax_get_vps_info,
@@ -1892,13 +1799,12 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
         browser, server_info, idx, phone_mask or mask_phone(phone), proxy,
         services=services,
         min_valid_days=MIN_VALID_DAYS,
-        max_renew_retries=MAX_RENEW_RETRIES_PER_URL,
-        max_warp_retries=MAX_WARP_RETRIES,
     )
     notify(result, phone, tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info)
     return result
 
 
+@retry_scope()
 def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = None,
             ip_info: str = "", proxy: str = None, phone_mask: str = "") -> Dict[str, Any]:
     result = {"username": phone, "phoneMask": phone_mask or mask_phone(phone),
@@ -1911,13 +1817,35 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
     except AuthenticationError as error:
         result["message"] = REASON_LABELS[error.reason]
         result["public_reason"] = error.reason
+        result["retry_count"] = retry_count()
         notify_login_fail(phone, tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info,
                           phone_mask=result.get("phoneMask", ""), reason=error.reason)
         return result
 
     # 2. 查询 VPS 信息
     publish_progress("reading_vps")
-    servers, error, dash_shot = hax_get_vps_info(browser, idx)
+    servers, error, dash_shot = [], "未能读取 VPS 信息页", None
+    for attempt in range(2):
+        retry = None
+        try:
+            require_time()
+            retry = start_retry(RetryStep.VPS_INFO) if attempt else None
+            servers, error, dash_shot = hax_get_vps_info(browser, idx)
+        except TimeoutError:
+            result["public_reason"] = "timeout"
+            servers, error, dash_shot = [], REASON_LABELS["timeout"], None
+            break
+        except Exception:
+            servers, error, dash_shot = [], "未能读取 VPS 信息页", None
+        valid_info = servers and all(public_expiry_valid(server.get("valid_until")) for server in servers)
+        known_status = not servers and error in {"", "PROVISIONING", "FAILED"}
+        if valid_info or known_status:
+            if retry:
+                retry.recovered = True
+            break
+        if attempt or not is_hax_url(browser.get_current_url(), "/vps-info"):
+            break
+    result["retry_count"] = retry_count()
     dash_shot = dash_shot or ""
     if not servers and not error:
         result["public_state"] = "no_vps"
@@ -1954,13 +1882,24 @@ def process(browser, phone: str, idx: int, tg_token: str = None, tg_chat: str = 
         print(f"    - ID: {safe_sid_for_filename(s['id'])}, Name: {s.get('name', 'Unknown')}")
 
     # 3. 对每个服务器续期
+    pending_reason = ""
     for srv in servers:
+        if pending_reason:
+            result["servers"].append(dict(
+                server_id=srv["id"], success=False,
+                old_valid_until=srv.get("valid_until", ""),
+                public_reason=pending_reason,
+                message="本账号上一次续期码请求仍未核实，暂停本次取码",
+            ))
+            continue
         publish_progress("renewing")
         r = renew(browser, srv, idx, phone,
                   tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info,
                   proxy=proxy, phone_mask=result.get("phoneMask", ""))
         result["servers"].append(r)
-        time.sleep(3)
+        if r.get("code_request_pending"):
+            pending_reason = r.get("public_reason", "renewal_code_unavailable")
+        time.sleep(min(3, remaining_time(3)))
 
     ok = sum(1 for s in result["servers"] if s.get("success"))
     result["success"] = ok > 0
@@ -2039,16 +1978,21 @@ class WarpManager:
             return False
         self.failure_reason = "warp_connection_failed"
         for _attempt in range(max_attempts):
+            # 连接恢复需要经过断开、注册和连接。剩余时间不足时保留当前连接状态。
+            if remaining_time(25) < 25:
+                raise TimeoutError("hax_operation_deadline")
+            retry = start_retry(RetryStep.WARP_CONNECT)
             current_ip = self._do_one_rotate()
             if current_ip:
+                retry.recovered = True
                 self._used_ips.add(current_ip)
                 self.failure_reason = "none"
                 return True
         return False
 
-    def _run(self, args: list, timeout: int = None) -> subprocess.CompletedProcess:
-        if timeout is None:
-            timeout = WARP_CMD_TIMEOUT
+    def _run(self, args: list, timeout: float | None = None) -> subprocess.CompletedProcess:
+        require_time()
+        timeout = remaining_time(WARP_CMD_TIMEOUT if timeout is None else timeout)
         cmd = ["sudo", "warp-cli", "--accept-tos"] + args
         print(f"  [WARP] 执行: {' '.join(cmd)}")
         proc = subprocess.Popen(
@@ -2057,6 +2001,7 @@ class WarpManager:
         )
         try:
             out, err = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
         except subprocess.TimeoutExpired:
             # 超时必须杀整个进程组：只杀 sudo 会留下孤儿 warp-cli 继续握着
             # stdout 管道，communicate() 会一直阻塞到它自然退出（曾卡 8 分钟）。
@@ -2066,9 +2011,14 @@ class WarpManager:
                 _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
             except Exception:
                 proc.kill()
-            out, err = proc.communicate()
+            try:
+                out, err = proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            returncode = 124
             print(f"  [WARP] ⚠️  命令超时({timeout}s)，已强杀进程组")
-        result = subprocess.CompletedProcess(cmd, proc.returncode or 0,
+        require_time()
+        result = subprocess.CompletedProcess(cmd, returncode,
                                              stdout=out or "", stderr=err or "")
         if result.stdout.strip():
             print(f"  [WARP] stdout: {result.stdout.strip()}")
@@ -2078,6 +2028,7 @@ class WarpManager:
 
     def _get_current_ip(self) -> str:
         # 换出口前后均查询系统直连 IPv4，不混用浏览器代理出口。
+        require_time()
         try:
             r = subprocess.run(
                 [
@@ -2092,18 +2043,26 @@ class WarpManager:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=remaining_time(20),
             )
+            require_time()
             if r.returncode == 0:
                 return str(IPv4Address(r.stdout.strip()))
+        except TimeoutError:
+            raise
         except Exception:
-            pass
+            require_time()
         return ""
 
     def _wait_connected(self, max_wait: int = 60) -> bool:
         print(f"  [WARP] 等待 VPN 连接就绪（最多 {max_wait}s）...")
-        deadline = time.monotonic() + max_wait
+        deadline = time.monotonic() + remaining_time(max_wait)
         while True:
+            require_time()
+            # 一次连接检查也受剩余时间限制。max_wait=0 仍允许做一次查询。
+            check_timeout = min(15, max(0, deadline - time.monotonic())) if max_wait else 15
+            if not check_timeout:
+                break
             try:
                 r = subprocess.run(
                     [
@@ -2118,8 +2077,9 @@ class WarpManager:
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=15,
+                    timeout=remaining_time(check_timeout),
                 )
+                require_time()
                 trace = dict(
                     line.split("=", 1) for line in r.stdout.splitlines() if "=" in line
                 )
@@ -2127,7 +2087,10 @@ class WarpManager:
                     IPv4Address(trace.get("ip", ""))
                     print("  [WARP] ✅ 已核实 WARP IPv4 连接")
                     return True
+            except TimeoutError:
+                raise
             except Exception as e:
+                require_time()
                 print(f"  [WARP] 等待中... ({e})")
             if time.monotonic() >= deadline:
                 break
@@ -2141,23 +2104,27 @@ class WarpManager:
         self.failure_reason = "warp_connection_failed"
         try:
             self._run(["disconnect"])
-            time.sleep(2)
+            time.sleep(remaining_time(2))
             self._run(["registration", "delete"])
-            time.sleep(2)
+            time.sleep(remaining_time(2))
             result = self._run(["registration", "new"])
+        except TimeoutError:
+            raise
         except OSError:
             return ""
         if result.returncode != 0:
             self.failure_reason = "warp_registration_failed"
             print("  [WARP] ❌ 注册失败")
             return ""
-        time.sleep(3)
+        time.sleep(remaining_time(3))
         try:
             if self._run(["connect"]).returncode != 0:
                 return ""
+        except TimeoutError:
+            raise
         except OSError:
             return ""
-        time.sleep(5)
+        time.sleep(remaining_time(5))
         if not self._wait_connected(max_wait=60):
             print("  [WARP] ❌ WARP 连接失败")
             return ""
@@ -2393,7 +2360,11 @@ def main():
             co.set_argument('--proxy-bypass-list', '<-loopback>')
             print('[INFO] 使用 Chromium 原生 SOCKS5 代理')
         page=ChromiumPage(co); page.set.timeouts(page_load=30,script=30); block_ad_domains(page); browser=DPBrowser(page)
-        get_warp_manager().record_initial_ip()
+        try:
+            get_warp_manager().record_initial_ip()
+        except TimeoutError:
+            # 交给账号入口报告超时，初始出口记录只用于统计。
+            pass
         for i, acc in enumerate(accounts, 1):
             browser.web_account = web
             browser.telegram_reader = None

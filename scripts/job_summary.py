@@ -287,6 +287,7 @@ def render_summary(
         "miss": "未命中，改为检查网站",
         "invalid": "记录无效，改为检查网站",
         "restore_failed": "恢复失败，改为检查网站",
+        "forced": "强制实测，本地预筛已跳过",
     }.get(environ.get("CACHE_STATUS", ""), "未完成")
     cache_save = _cache_save(environ, skipped)
     title = f"{'Hax' if platform == 'hax' else 'Woiden'} · {'账号 #' + str(index) if index else '账号配置'}"
@@ -361,8 +362,9 @@ def render_summary(
         )
         lines.append(f"| 续期脚本耗时 | {duration} |")
     if summary:
+        retry_label = "重试操作" if platform == "hax" else "续期重试"
         lines += [
-            f"| 续期重试 | {summary['retries']} 次 |",
+            f"| {retry_label} | {summary['retries']} 次 |",
             f"| WARP 更换 IP | {summary['warp_swaps']} 次 |",
             f"| WARP 刷新 | {summary['warp_refresh']} 次 |",
         ]

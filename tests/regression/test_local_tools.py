@@ -312,9 +312,43 @@ class LocalRuntimeTests(unittest.TestCase):
         return run.import_configuration(self.source, self.private, os.getuid())
 
     def test_local_configuration_does_not_inherit_unrelated_hax_values(self) -> None:
-        with patch.dict(os.environ, HAX_UNRELATED="EXAMPLE_PRIVATE_VALUE"):
+        with patch.dict(os.environ, HAX_UNRELATED="EXAMPLE_PRIVATE_VALUE", HAX_FORCE_RENEWAL="1"):
             env = self.environment()
         self.assertNotIn("HAX_UNRELATED", env)
+        self.assertNotIn("HAX_FORCE_RENEWAL", env)
+
+    def test_cli_runs_each_account_once_for_the_selected_command(self) -> None:
+        for command, force in (("renew", False), ("renew", True), ("check-auth", False)):
+            arguments = [command, "--force"] if force else [command]
+            for codes in ((0, 0), (1, 0)):
+                with (
+                    self.subTest(command=command, force=force, codes=codes),
+                    patch.object(run.signal, "signal"),
+                    patch.dict(os.environ, HAX_DATA_UID=str(os.getuid())),
+                    patch.object(run, "import_configuration", return_value=web_environment(2)),
+                    patch.object(run, "run_account", side_effect=codes) as worker,
+                ):
+                    self.assertEqual(run.main(arguments), max(codes))
+                    self.assertEqual(
+                        [call.args[1:4] for call in worker.call_args_list],
+                        [("A001", 1, command), ("A002", 2, command)],
+                    )
+                    self.assertEqual(
+                        [call.kwargs["force"] for call in worker.call_args_list],
+                        [force, force],
+                    )
+
+    def test_cli_requires_a_subcommand_and_force_belongs_to_renewal(self) -> None:
+        with (
+            patch.object(run, "import_configuration") as importer,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(run.main([]), 0)
+            self.assertIn("check-auth", output.getvalue())
+            self.assertIn("renew", output.getvalue())
+            self.assertNotEqual(run.main(["check-auth", "--force"]), 0)
+            self.assertNotEqual(run.main(["--mode", "readonly"]), 0)
+        importer.assert_not_called()
 
     def test_killed_child_does_not_turn_overall_exit_status_into_success(self) -> None:
         with (
@@ -323,10 +357,12 @@ class LocalRuntimeTests(unittest.TestCase):
             patch.object(run, "import_configuration", return_value=web_environment()),
             patch.object(run, "run_account", return_value=-signal.SIGKILL) as worker,
         ):
-            self.assertNotEqual(run.main(["--mode", "readonly"]), 0)
+            self.assertNotEqual(run.main(["check-auth"]), 0)
         worker.assert_called_once()
 
-    def worker(self, skipped: bool = False, identifier: str = "A002") -> None:
+    def worker(
+        self, skipped: bool = False, identifier: str = "A002", *, force: bool = False
+    ) -> None:
         (self.work / "hax-renew.py").write_text(
             """import os, sys
 from scripts.renewal_config import worker_account
@@ -337,6 +373,9 @@ assert item["id"] == """
             + """
 assert "RENEWAL_ACCOUNTS" not in os.environ
 assert "RENEWAL_ACCOUNTS_FILE" not in os.environ
+assert os.environ.get("HAX_FORCE_RENEWAL") == """
+            + repr("1" if force else None)
+            + """
 record_notification("text", True)
 record_notification("photo", True)
 sys.exit(publish_results([{"username": item["phone"], "servers": [{
@@ -348,28 +387,67 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
 """
         )
 
-    def test_files_and_actions_fields_reach_same_formal_entry_with_isolated_account(
-        self,
-    ) -> None:
+    def test_local_files_use_actions_fields_and_isolate_the_formal_worker(self) -> None:
         self.worker()
         env = self.environment()
-        for mode in ("file", "actions"):
-            destination = self.root / mode
-            with patch.object(run, "connect_warp"):
-                code = run.run_account(
-                    env, "A002", 2, "renew", mode, destination, self.state
-                )
-            self.assertEqual(code, 0)
-            receipt = load_private_json(destination / "receipt.json")
-            self.assertIsInstance(receipt, dict)
-            if not isinstance(receipt, dict):
-                raise AssertionError("invalid_receipt")
-            self.assertEqual(receipt["result"], "renewed")
-            self.assertFalse(receipt["github_cache_uploaded"])
-            self.assertTrue(receipt["local_cache_saved"])
-            self.assertIn("本地文件间模拟", (destination / "summary.md").read_text())
-            self.assertFalse((self.work / "output").exists())
+        self.assertIn("RENEWAL_ACCOUNTS", env)
+        self.assertIn("TELEGRAM_BOT_TOKEN", env)
+        self.assertNotIn("RENEWAL_ACCOUNTS_FILE", env)
+        self.assertNotIn("TELEGRAM_BOT_TOKEN_FILE", env)
+        destination = self.root / "renew"
+        with patch.object(run, "connect_warp"):
+            code = run.run_account(env, "A002", 2, "renew", destination, self.state)
+        self.assertEqual(code, 0)
+        receipt = load_private_json(destination / "receipt.json")
+        if not isinstance(receipt, dict):
+            raise AssertionError("invalid_receipt")
+        self.assertEqual(receipt["result"], "renewed")
+        self.assertEqual(receipt["input"], "actions")
+        self.assertFalse(receipt["force"])
+        self.assertFalse(receipt["github_cache_uploaded"])
+        self.assertTrue(receipt["local_cache_saved"])
+        self.assertIn("本地文件间模拟", (destination / "summary.md").read_text())
+        self.assertFalse((self.work / "output").exists())
         self.assertEqual(len(configured_accounts(env)), 2)
+
+    def test_only_force_bypasses_an_eligible_local_cache(self) -> None:
+        env = self.environment()
+        fields = runtime_account(
+            "hax", dict(env, RENEWAL_ACCOUNT_ID="A002"), with_notification=False
+        )
+        key = public_account_id("hax", fields)
+        cached = self.state / (key + ".json")
+        expiry = "2099-12-31"
+        save_private_json(cached, dict(version=1, platform="hax", account=key, state=expiry))
+        original_workflow = run.workflow
+
+        def workflow(operation: str, environment: dict[str, str]) -> tuple[int, dict[str, str]]:
+            if operation == "notify-skipped":
+                return 0, {"notification_status": "sent"}
+            return original_workflow(operation, environment)
+
+        normal, forced = self.root / "normal", self.root / "forced"
+        self.worker(force=True)
+        with (
+            patch.object(run, "workflow", side_effect=workflow) as steps,
+            patch.object(run, "connect_warp") as warp,
+        ):
+            self.assertEqual(run.run_account(env, "A002", 2, "renew", normal, self.state), 0)
+            warp.assert_not_called()
+            steps.reset_mock()
+            self.assertEqual(
+                run.run_account(env, "A002", 2, "renew", forced, self.state, force=True), 0
+            )
+            warp.assert_called_once()
+            self.assertNotIn("check", [call.args[0] for call in steps.call_args_list])
+        normal_receipt = load_private_json(normal / "receipt.json")
+        forced_receipt = load_private_json(forced / "receipt.json")
+        if not isinstance(normal_receipt, dict) or not isinstance(forced_receipt, dict):
+            raise AssertionError("invalid_receipt")
+        self.assertEqual(normal_receipt["result"], "skipped")
+        self.assertEqual(forced_receipt["result"], "renewed")
+        self.assertTrue(forced_receipt["force"])
+        self.assertIn("强制实测，本地预筛已跳过", (forced / "summary.md").read_text())
 
     def test_local_receipt_separates_navigation_from_notification_counts(self) -> None:
         self.worker()
@@ -392,7 +470,6 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
                     "A002",
                     2,
                     "renew",
-                    "file",
                     destination,
                     self.state,
                 ),
@@ -419,20 +496,10 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
         save_private_json(accounts_path, dict(version=1, accounts=[first, second]))
         self.worker(identifier=second["id"])
         env = self.environment()
-        for mode in ("file", "actions"):
-            with patch.object(run, "connect_warp"):
-                self.assertEqual(
-                    run.run_account(
-                        env,
-                        second["id"],
-                        2,
-                        "renew",
-                        mode,
-                        self.root / mode,
-                        self.state,
-                    ),
-                    0,
-                )
+        with patch.object(run, "connect_warp"):
+            self.assertEqual(
+                run.run_account(env, second["id"], 2, "renew", self.root / "run", self.state), 0
+            )
 
     def test_cli_selects_user_identifier_and_derives_safe_result_paths(self) -> None:
         first, second = web_account(), web_account(2)
@@ -448,25 +515,25 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
             patch.object(run, "run_account", return_value=1) as worker,
         ):
             self.assertEqual(
-                run.main(["--mode", "readonly", "--account-identifier", first["id"]]), 1
+                run.main(["check-auth", "--account-identifier", first["id"]]), 1
             )
         worker.assert_called_once()
         self.assertEqual(worker.call_args.args[1], first["id"])
-        destination = worker.call_args.args[5]
+        destination = worker.call_args.args[4]
         self.assertEqual(destination.name, identifier_directory(first["id"]))
         self.assertEqual(destination.parent.parent, Path("/mnt/hax-results"))
 
     def test_site_skip_is_not_reported_as_full_renewal_success(self) -> None:
-        self.worker(skipped=True)
+        self.worker(skipped=True, force=True)
         with patch.object(run, "connect_warp"):
             code = run.run_account(
                 self.environment(),
                 "A002",
                 2,
                 "renew",
-                "file",
                 self.root / "skipped",
                 self.state,
+                force=True,
             )
         self.assertNotEqual(code, 0)
         receipt = load_private_json(self.root / "skipped/receipt.json")
@@ -486,7 +553,7 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
         destination = self.root / "damaged-cache"
         with patch.object(run, "connect_warp"):
             code = run.run_account(
-                env, "A002", 2, "policy", "file", destination, self.state
+                env, "A002", 2, "renew", destination, self.state
             )
         self.assertEqual(code, 0)
         self.assertIn(
@@ -523,8 +590,7 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
                     env,
                     "A002",
                     2,
-                    "readonly",
-                    "file",
+                    "check-auth",
                     destination,
                     self.state,
                 ),
@@ -543,8 +609,7 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
                 env,
                 "A002",
                 2,
-                "readonly",
-                "file",
+                "check-auth",
                 self.root / "readonly-network-failed",
                 self.state,
             )
@@ -576,8 +641,7 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
                 self.environment(),
                 "A002",
                 2,
-                "readonly",
-                "file",
+                "check-auth",
                 destination,
                 self.state,
             )
@@ -608,7 +672,7 @@ sys.exit(publish_results([{"username": item["phone"], "servers": [{
                 self.assertRaises(type(failure)),
             ):
                 run.run_account(
-                    env, "A002", 2, "readonly", "file", destination, self.state
+                    env, "A002", 2, "check-auth", destination, self.state
                 )
             receipt = load_private_json(destination / "receipt.json")
             if not isinstance(receipt, dict):

@@ -17,7 +17,9 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import patch
 
+from scripts.hax_renewal.retry_report import RetryStep, retry_scope, start_retry
 from scripts.hax_renewal import flow, operations
+from tests.live import warp
 from tests.regression.fixtures import RenewalFeedbackFixture, renewal_browser
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -93,6 +95,11 @@ def warp_functions(clock: Clock) -> dict[str, Any]:
         IPv4Address=IPv4Address,
         WARP_CMD_TIMEOUT=2,
         WarpError=flow.WarpError,
+        RetryStep=RetryStep,
+        retry_scope=retry_scope,
+        start_retry=start_retry,
+        require_time=operations.require_time,
+        remaining_time=operations.remaining_time,
         CaptchaBlocked=flow.CaptchaBlocked,
         RenewalServices=flow.RenewalServices,
         run_renewal=flow.run_renewal,
@@ -161,6 +168,16 @@ class WarpTests(unittest.TestCase):
             (self.manager.rotation_count, self.manager.warp_refresh_count), (0, 0)
         )
         self.assertFalse(any(args[0] == "sudo" for args in self.commands()))
+
+    def test_diagnostic_entry_can_run_both_modes_with_the_existing_cli(self) -> None:
+        for mode, result in (("ready", "ready"), ("rotate", "changed")):
+            with self.subTest(mode=mode):
+                self.configure(commands=[], next_ips=["198.51.100.2"])
+                with patch("tests.live.warp.time", self.clock):
+                    self.assertEqual(warp.main(["--mode", mode, "--attempts", "1"]), 0)
+                report = json.loads(self.output.getvalue().splitlines()[-1])
+                self.assertEqual(report["result"], result)
+                self.assertEqual(report["warp_swaps"], int(mode == "rotate"))
 
     def test_disconnected_preparation_accepts_same_ip_after_connection(self) -> None:
         self.manager.record_initial_ip()
@@ -233,6 +250,35 @@ class WarpTests(unittest.TestCase):
             self.assertFalse(self.manager.ensure_ready(max_attempts=1))
             self.assertEqual(self.manager.failure_reason, reason)
 
+    def test_reconnect_is_skipped_when_only_the_report_budget_remains(self) -> None:
+        self.configure(ready=False)
+        with (
+            patch.dict(os.environ, HAX_OPERATION_DEADLINE="1"),
+            patch("scripts.hax_renewal.timing.monotonic", self.clock.monotonic),
+        ):
+            with self.assertRaises(TimeoutError):
+                self.manager.ensure_ready(max_attempts=1)
+        self.assertFalse(any(args[0] == "sudo" for args in self.commands()))
+
+    def test_current_connection_poll_cannot_use_up_reserved_report_time(self) -> None:
+        self.configure(ready=False)
+        timeouts: list[float] = []
+
+        def slow_connection(args: list[str], *, timeout: float, **kwargs: object):
+            timeouts.append(timeout)
+            self.clock.sleep(timeout)
+            raise subprocess.TimeoutExpired(args, timeout)
+
+        with (
+            patch.dict(os.environ, HAX_OPERATION_DEADLINE="2"),
+            patch("scripts.hax_renewal.timing.monotonic", self.clock.monotonic),
+            patch("subprocess.run", side_effect=slow_connection),
+        ):
+            with self.assertRaises(TimeoutError):
+                self.manager.ensure_ready(max_attempts=1)
+        self.assertEqual(timeouts, [2])
+        self.assertEqual(self.clock.monotonic(), 2)
+
     def business(self) -> tuple[dict[str, Any], list[str], SimpleNamespace]:
         """业务函数保留实际网络判断，浏览器、消息服务和通知使用替身。"""
         namespace = self.namespace
@@ -242,7 +288,6 @@ class WarpTests(unittest.TestCase):
             events,
         )
         clock = SimpleNamespace(sleep=lambda seconds: None, time=lambda: 0)
-        self.enterContext(patch.object(flow, "time", clock))
         self.enterContext(patch.object(operations, "time", clock))
         self.enterContext(patch.object(operations, "RenewalFeedback", RenewalFeedbackFixture))
         namespace.update(
@@ -255,7 +300,6 @@ class WarpTests(unittest.TestCase):
             handoff_browser_to_warp=lambda *args: True,
             _prepare_warp_page=lambda *args: None,
             _prepare_final_form=lambda *args: True,
-            _renew_refresh_code_page_after_captcha=lambda *args: False,
             removeAds=lambda *args: None,
             _capture_renewal_page=lambda *args: None,
             hax_get_vps_info=lambda *args: ([], "", None),
@@ -263,7 +307,7 @@ class WarpTests(unittest.TestCase):
         )
         return namespace, events, browser
 
-    def test_final_code_page_stops_when_required_ip_change_fails(self) -> None:
+    def test_final_code_page_verification_failure_stops_without_switching_exit(self) -> None:
         events = []
 
         def captcha_refused() -> None:
@@ -280,22 +324,19 @@ class WarpTests(unittest.TestCase):
             execute_script=lambda script: True,
             open=lambda url: events.append("opened"),
         )
-        with self.assertRaises(self.namespace["WarpError"]) as error:
-            self.namespace["_prepare_final_form"](
-                browser, 1, "example", max_retries=2
-            )
-        self.assertEqual(error.exception.reason, "warp_new_exit_unavailable")
+        with self.assertRaises(self.namespace["CaptchaBlocked"]):
+            self.namespace["_prepare_final_form"](browser, 1, "example")
         self.assertEqual(events, [])
 
     def test_first_business_attempt_can_submit_on_existing_exit(self) -> None:
         namespace, events, browser = self.business()
-        result = namespace["renew"](browser, {"id": "example"}, 1, "+1-5550001234")
+        result = namespace["renew"](browser, dict(id="example", valid_until="2026-11-16", current_date="2026-11-16"), 1, "+1-5550001234")
         self.assertTrue(result["success"], result.get("message"))
         self.assertEqual(events.count("final_submit"), 1)
         self.assertEqual(result["warp_swaps"], 0)
         self.assertEqual(result["warp_refresh"], 0)
 
-    def test_failed_strict_recovery_stops_before_another_submission(self) -> None:
+    def test_failed_initial_verification_stops_before_requesting_code(self) -> None:
         namespace, events, browser = self.business()
         namespace["MAX_RENEW_RETRIES_PER_URL"] = 2
         attempts = []
@@ -305,17 +346,19 @@ class WarpTests(unittest.TestCase):
             raise namespace["CaptchaBlocked"]("example captcha failure")
 
         namespace["_check_initial_form"] = refused
-        result = namespace["renew"](browser, {"id": "example"}, 1, "+1-5550001234")
+        result = namespace["renew"](browser, dict(id="example", valid_until="2026-11-16", current_date="2026-11-16"), 1, "+1-5550001234")
         self.assertFalse(result["success"])
-        self.assertEqual(result["public_reason"], "warp_new_exit_unavailable")
+        self.assertEqual(result["public_reason"], "captcha_failed")
         self.assertEqual(events, [])
         self.assertEqual(attempts, ["failed"])
 
-    def test_outer_retry_still_requires_a_different_exit(self) -> None:
+    def test_site_rejection_stops_without_repeating_request_or_switching_exit(self) -> None:
         namespace, events, browser = self.business()
         namespace["MAX_RENEW_RETRIES_PER_URL"] = 2
         browser.page.feedback = dict(status="failed", date="", source="dialog", reason="code")
-        result = namespace["renew"](browser, {"id": "example"}, 1, "+1-5550001234")
+        result = namespace["renew"](browser, dict(id="example", valid_until="2026-11-16", current_date="2026-11-16"), 1, "+1-5550001234")
         self.assertFalse(result["success"])
-        self.assertEqual(result["public_reason"], "warp_new_exit_unavailable")
+        self.assertEqual(result["public_reason"], "renewal_failed")
+        self.assertEqual(events.count("form_submit"), 1)
         self.assertEqual(events.count("final_submit"), 1)
+        self.assertEqual(result["warp_swaps"], 0)

@@ -51,10 +51,6 @@ jobs:
       PUBLIC_SUMMARY_DEFERRED: '1'
       SKIP_DAYS: '5'
       HAX_MIN_VALID_DAYS: '5'
-      # 续期重试次数（外层）
-      MAX_RENEW_RETRIES: '5'
-      # IP 被封时切换 WARP 重试次数（内层）
-      MAX_WARP_RETRIES: '10'
     steps:
       - name: 检出仓库
         id: checkout

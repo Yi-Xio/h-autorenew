@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
+from scripts.hax_renewal.retry_report import format_retry_report, retry_scope
 from scripts.hax_login import (
     hax_status,
     read_existing_authorization,
@@ -51,10 +52,10 @@ class SitePage:
             else [dict(CONFIGURATION), True, "authenticated"]
         )
         self.requests: list[tuple[str, dict[str, Any]]] = []
-        self.created_urls: list[str] = []
+        self.created_urls: list[str | None] = []
         self.browser = SimpleNamespace(new_tab=self.new_tab)
 
-    def new_tab(self, url: str) -> WidgetPage:
+    def new_tab(self, url: str | None = None) -> WidgetPage:
         self.created_urls.append(url)
         return self.widget
 
@@ -82,7 +83,7 @@ class Browser:
         self.visited: list[str] = []
         self.challenge_clicks = 0
 
-    def open(self, url: str) -> None:
+    def open(self, url: str, *, timeout: float = 30) -> None:
         self.visited.append(url)
 
     def click_turnstile(self) -> None:
@@ -140,6 +141,41 @@ class HaxLoginTests(unittest.TestCase):
         for forbidden in ("/auth/request", "confirmRequest", "sendMessage", "777000"):
             self.assertNotIn(forbidden, outgoing)
         self.assertEqual(len(widget.requests), 2)
+
+    def test_loading_login_widget_can_reopen_login_page_once(self) -> None:
+        page = SitePage(responses=[None, "login_required"] * 3 + [
+            "login_required", dict(CONFIGURATION), True, "authenticated",
+        ])
+        browser = Browser(page)
+        elapsed = 0.0
+
+        def sleep(seconds: float) -> None:
+            nonlocal elapsed
+            elapsed += seconds
+
+        clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep, time=time.time)
+        with patch("scripts.hax_login.time", clock):
+            restore_hax(browser, web_account()["hax_web"], timeout=2)
+        self.assertEqual(browser.visited, ["https://hax.co.id/login"] * 2)
+        self.assertEqual(len(page.callbacks()), 1)
+
+    def test_lost_callback_response_checks_session_without_repeating_callback(self) -> None:
+        page = SitePage()
+        run_cdp = page.run_cdp
+
+        def lose_callback(method: str, **arguments: Any) -> dict[str, Any]:
+            value = run_cdp(method, **arguments)
+            if "location.assign" in arguments.get("expression", ""):
+                raise OSError("EXAMPLE_CALLBACK_DISCONNECT")
+            return value
+
+        page.run_cdp = lose_callback
+        restore_hax(Browser(page), web_account()["hax_web"], timeout=0)
+        self.assertEqual(len(page.callbacks()), 1)
+        self.assertEqual(
+            json.loads(self.report.read_text())["details"]["checks"]["authentication"],
+            dict(step="callback", result="ready"),
+        )
 
     def test_missing_or_wrong_account_authorization_never_calls_hax_callback(
         self,
@@ -253,6 +289,63 @@ class HaxLoginTests(unittest.TestCase):
                 "missing" if reason == "hax_widget_unverified" else "unavailable",
             )
 
+    def test_existing_authorization_widget_reopens_only_when_still_loading(self) -> None:
+        for state in ("loading", "invalid"):
+            with self.subTest(state=state):
+                widget = WidgetPage()
+                widget.responses = (
+                    ["loading", "loading", "loading", True, authorization()]
+                    if state == "loading"
+                    else ["invalid"]
+                )
+                page = SitePage(widget)
+                elapsed = 0.0
+
+                def sleep(seconds: float) -> None:
+                    nonlocal elapsed
+                    elapsed += seconds
+
+                clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep, time=time.time)
+                with (
+                    retry_scope(),
+                    patch("scripts.hax_login.time", clock),
+                ):
+                    if state == "loading":
+                        read_existing_authorization(page, "900000001", timeout=2)
+                        self.assertEqual(len(widget.visited), 2)
+                        self.assertEqual(widget.visited[0], widget.visited[1])
+                        self.assertIn("Telegram 授权组件（已恢复）", format_retry_report())
+                    else:
+                        with self.assertRaises(AuthenticationError) as error:
+                            read_existing_authorization(page, "900000001", timeout=2)
+                        self.assertEqual(error.exception.reason, "hax_widget_unverified")
+                        self.assertEqual(len(widget.visited), 1)
+                queries = [
+                    values for _, values in widget.requests if "fetch(" in values.get("expression", "")
+                ]
+                self.assertEqual(len(queries), int(state == "loading"))
+                self.assertTrue(widget.closed)
+
+    def test_temporarily_unreadable_widget_is_checked_again_without_reopening(self) -> None:
+        widget = WidgetPage()
+        original = widget.run_cdp
+        calls = 0
+
+        def read(method: str, **arguments: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("EXAMPLE_TEMPORARY_READ_ERROR")
+            return original(method, **arguments)
+
+        widget.run_cdp = read
+        with retry_scope(), patch("scripts.hax_login.time.sleep"):
+            result = read_existing_authorization(SitePage(widget), "900000001", timeout=5)
+            self.assertIn("重新读取 Hax 的 Telegram 授权组件（已恢复）", format_retry_report())
+        self.assertEqual(result["id"], "900000001")
+        self.assertEqual(len(widget.visited), 1)
+        self.assertEqual(calls, 3)
+
     def test_missing_site_widget_is_distinguished_from_missing_oauth_widget(
         self,
     ) -> None:
@@ -360,6 +453,30 @@ class HaxNavigationTests(unittest.TestCase):
                     timeout=0,
                 )
             self.assertEqual(error.exception.reason, reason)
+
+    def test_navigation_rejects_a_ready_response_after_the_account_deadline(self) -> None:
+        elapsed = 100.0
+        limits: list[float] = []
+
+        def read(method: str, **arguments: Any) -> dict[str, Any]:
+            nonlocal elapsed
+            limits.append(arguments["_timeout"])
+            elapsed += 15
+            return {"result": {"value": navigation_sample()}}
+
+        def monotonic() -> float:
+            return elapsed
+
+        browser = Browser(SitePage())
+        browser.page.run_cdp = read
+        with (
+            patch.dict(os.environ, HAX_OPERATION_DEADLINE="101"),
+            patch("scripts.hax_login.time.monotonic", monotonic),
+            patch("scripts.hax_renewal.timing.monotonic", monotonic),
+            self.assertRaises(TimeoutError),
+        ):
+            wait_hax_navigation(browser, "https://hax.co.id/vps-renew-code")
+        self.assertEqual(limits, [1.0])
 
     def test_navigation_report_is_bounded_and_rejects_page_text(self) -> None:
         record_check("authentication", "callback", "ready")

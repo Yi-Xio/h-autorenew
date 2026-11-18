@@ -7,6 +7,8 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 from scripts.browser_setup import has_adblock_dialog, install_hax_rules
+from scripts.hax_renewal.retry_report import RetryStep, start_retry
+from scripts.hax_renewal.timing import remaining_time, require_time
 from scripts.public_report import record_check, record_navigation
 from scripts.web_sessions import (
     HAX_CLIENT,
@@ -21,7 +23,15 @@ from scripts.web_sessions import (
 Page = Any
 
 
-def _evaluate(page: Page, script: str, *arguments: object) -> Any:
+def _evaluate(
+    page: Page, script: str, *arguments: object,
+    deadline: float | None = None, timeout: float = 5,
+) -> Any:
+    available = require_time(timeout)
+    if deadline is not None:
+        available = min(available, deadline - time.monotonic())
+        if available <= 0:
+            raise AuthenticationError("browser_unavailable")
     expression = (
         "(function(){" + script + "}).apply(null," + json.dumps(list(arguments)) + ")"
     )
@@ -31,21 +41,24 @@ def _evaluate(page: Page, script: str, *arguments: object) -> Any:
             expression=expression,
             awaitPromise=True,
             returnByValue=True,
+            _timeout=available,
         )
-        if (
-            not isinstance(result, dict)
-            or result.get("exceptionDetails")
-            or not isinstance(result.get("result"), dict)
-        ):
-            raise AuthenticationError("browser_unavailable")
-        return result["result"].get("value")
-    except AuthenticationError:
-        raise
     except Exception:
+        require_time()
         raise AuthenticationError("browser_unavailable") from None
+    require_time()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise AuthenticationError("browser_unavailable")
+    if (
+        not isinstance(result, dict)
+        or result.get("exceptionDetails")
+        or not isinstance(result.get("result"), dict)
+    ):
+        raise AuthenticationError("browser_unavailable")
+    return result["result"].get("value")
 
 
-def hax_status(browser: Page) -> str:
+def hax_status(browser: Page, *, deadline: float | None = None) -> str:
     """区分受保护页面、登录页、访问验证及未知页面。"""
     try:
         if has_adblock_dialog(browser.page):
@@ -67,6 +80,7 @@ def hax_status(browser: Page) -> str:
                 .some(element => element.textContent.trim() === 'VPS Information');
             return logout && info && location.pathname.replace(/\/$/, '') === '/vps-info' ? 'authenticated' : 'unknown';
         """,
+            deadline=deadline,
         )
         return (
             status
@@ -75,24 +89,29 @@ def hax_status(browser: Page) -> str:
             in {"authenticated", "login_required", "challenge", "unknown", "adblock"}
             else "unknown"
         )
+    except TimeoutError:
+        raise
     except Exception:
         return "unknown"
 
 
-def wait_hax_navigation(browser: Page, target_url: str, timeout: float = 60) -> None:
+def wait_hax_navigation(
+    browser: Page, target_url: str, timeout: float = 60, *, attempt_challenge: bool = True
+) -> None:
     """核实已解析的目标业务页；资源仍加载时额外要求本轮规则标识一致。"""
     target = urlsplit(target_url)
     if target.scheme != "https" or target.netloc != "hax.co.id":
         raise AuthenticationError("hax_page_unverified")
     expected_path = target.path.rstrip("/")
-    if expected_path not in {"", "/vps-info", "/vps-renew-code"}:
+    if expected_path not in {"", "/vps-info", "/vps-renew", "/vps-renew-code"}:
         raise AuthenticationError("hax_page_unverified")
     started = time.monotonic()
-    deadline = started + timeout
+    deadline = started + remaining_time(timeout)
     challenged = False
     previous = None
     last_recorded = started
     while True:
+        require_time()
         if has_adblock_dialog(browser.page):
             raise AuthenticationError("adblock_detected")
         try:
@@ -100,7 +119,7 @@ def wait_hax_navigation(browser: Page, target_url: str, timeout: float = 60) -> 
                 browser.page,
                 r"""
                 const path=location.pathname.replace(/\/$/, '');
-                const route={'':'home','/vps-info':'info','/vps-renew-code':'renew_code','/login':'login'};
+                const route={'':'home','/vps-info':'info','/vps-renew':'renew','/vps-renew-code':'renew_code','/login':'login'};
                 const expected_origin=location.origin==='https://hax.co.id';
                 if (!expected_origin) return {expected_origin:false,path_match:false,
                     logout_link:false,login_page:false,code_input:false,submit_button:false,
@@ -135,12 +154,18 @@ def wait_hax_navigation(browser: Page, target_url: str, timeout: float = 60) -> 
                 else if (path!==arguments[0] || !logout) status='unknown';
                 else if (arguments[0] === '/vps-renew-code') {
                     status=input && button ? 'ready' : 'unknown';
+                } else if (arguments[0] === '/vps-renew') {
+                    const address=!!document.querySelector('#web_address,input[name="web_address"]');
+                    const agreement=!!document.querySelector('input[name="agreement"]');
+                    const request=!!document.querySelector('button[name="submit_button"]');
+                    status=address && agreement && request ? 'ready' : 'unknown';
                 } else if (arguments[0] === '/vps-info') {
                     status=info ? 'ready' : 'unknown';
                 } else status='ready';
                 return {...snapshot,status};
                 """,
                 expected_path,
+                deadline=deadline if timeout else None,
             )
         except AuthenticationError:
             observation = dict(
@@ -174,6 +199,7 @@ def wait_hax_navigation(browser: Page, target_url: str, timeout: float = 60) -> 
                     expected_route={
                         "": "home",
                         "/vps-info": "info",
+                        "/vps-renew": "renew",
                         "/vps-renew-code": "renew_code",
                     }[expected_path],
                     elapsed_seconds=max(0, int(now - started)),
@@ -181,13 +207,15 @@ def wait_hax_navigation(browser: Page, target_url: str, timeout: float = 60) -> 
             )
             previous, last_recorded = observation, now
         status = observation.get("status")
-        if status == "ready":
+        if status == "ready" and (not timeout or now < deadline):
             return
         if status == "adblock":
             raise AuthenticationError("adblock_detected")
         if status == "login_required":
             raise AuthenticationError("hax_session_invalid")
         if status == "challenge":
+            if not attempt_challenge:
+                raise AuthenticationError("access_blocked")
             challenged = True
         if time.monotonic() >= deadline:
             raise AuthenticationError(
@@ -198,7 +226,7 @@ def wait_hax_navigation(browser: Page, target_url: str, timeout: float = 60) -> 
                 browser.click_turnstile()
             except Exception:
                 pass
-        time.sleep(0.5)
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
 
 
 def read_existing_authorization(
@@ -220,33 +248,76 @@ def read_existing_authorization(
     query = dict(origin=HAX_ORIGIN, return_to=HAX_ORIGIN + "/login")
     if request_access:
         query["request_access"] = request_access
+    widget_url = HAX_LOGIN_ORIGIN + "/embed/" + HAX_LOGIN_BOT + "?" + urlencode(query)
     widget = None
     try:
+        window = require_time(timeout or 30)
+        started = time.monotonic()
+        deadline = started + window
+        probe_deadline = deadline if timeout else None
+        reopen_at = started + window / 2
         record_check("authentication", "oauth_widget", "waiting")
-        widget = page.browser.new_tab(
-            HAX_LOGIN_ORIGIN + "/embed/" + HAX_LOGIN_BOT + "?" + urlencode(query)
-        )
-        widget.set.timeouts(page_load=30, script=30)
-        deadline = time.monotonic() + timeout
+        widget = page.browser.new_tab()
+        initial_timeout = min(require_time(30), deadline - time.monotonic(), window / 2)
+        if initial_timeout <= 0:
+            raise AuthenticationError("hax_widget_unverified")
+        try:
+            widget.get(widget_url, retry=0, timeout=initial_timeout)
+        except Exception:
+            pass
+        retry = read_retry = None
+        unavailable = False
         while True:
-            ready = _evaluate(
-                widget,
-                """
-                return location.origin === 'https://oauth.telegram.org' &&
-                    location.pathname === '/embed/LoginHaxBot' &&
-                    typeof TWidgetLogin === 'object' &&
-                    String(TWidgetLogin.botId) === '5938743585' &&
-                    TWidgetLogin.params.origin === 'https://hax.co.id';
-            """,
-            )
+            if unavailable and read_retry is None and time.monotonic() < deadline:
+                read_retry = start_retry(RetryStep.HAX_AUTH_READ)
+            try:
+                ready = _evaluate(
+                    widget,
+                    """
+                    if (location.origin !== 'https://oauth.telegram.org' ||
+                        location.pathname !== '/embed/LoginHaxBot') return false;
+                    if (typeof TWidgetLogin !== 'object' || !TWidgetLogin) return 'loading';
+                    return String(TWidgetLogin.botId) === '5938743585' &&
+                        TWidgetLogin.params?.origin === 'https://hax.co.id' ? true : 'invalid';
+                    """,
+                    deadline=probe_deadline,
+                )
+            except AuthenticationError:
+                if not timeout:
+                    raise
+                ready = None
+                unavailable = True
+            else:
+                if read_retry is not None and ready in (True, "loading"):
+                    read_retry.recovered = True
+                    read_retry = None
+                    unavailable = False
             if ready is True:
+                if retry:
+                    retry.recovered = True
                 record_check("authentication", "oauth_widget", "ready")
                 break
-            if time.monotonic() >= deadline:
+            if ready == "invalid":
+                record_check("authentication", "oauth_widget", "invalid")
+                raise AuthenticationError("hax_widget_unverified")
+            now = time.monotonic()
+            if not timeout or now >= deadline:
                 record_check("authentication", "oauth_widget", "missing")
                 raise AuthenticationError("hax_widget_unverified")
-            time.sleep(0.5)
+            if ready == "loading" and retry is None and now >= reopen_at:
+                reopen_timeout = require_time(min(30, deadline - now))
+                retry = start_retry(RetryStep.HAX_AUTH_WIDGET)
+                try:
+                    widget.get(widget_url, retry=0, timeout=reopen_timeout)
+                except Exception:
+                    pass
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
         record_check("authentication", "authorization", "reading")
+        request_timeout = require_time(15)
+        if probe_deadline is not None:
+            request_timeout = min(request_timeout, probe_deadline - time.monotonic())
+            if request_timeout <= 0:
+                raise AuthenticationError("hax_widget_unverified")
         result = _evaluate(
             widget,
             """
@@ -256,7 +327,7 @@ def read_existing_authorization(
                 String(TWidgetLogin.botId) !== '5938743585' ||
                 TWidgetLogin.params.origin !== 'https://hax.co.id') return {_widget_context_invalid:true};
             const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 15000);
+            const timer = setTimeout(() => controller.abort(), arguments[0]);
             return fetch('/auth/get?bot_id=5938743585', {
                 method: 'POST', credentials: 'include', signal: controller.signal,
                 headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'},
@@ -266,7 +337,10 @@ def read_existing_authorization(
                 if (!response.ok || target.origin !== 'https://oauth.telegram.org' || target.pathname !== '/auth/get') return null;
                 return await response.json();
             }).catch(() => null).finally(() => clearTimeout(timer));
-        """,
+            """,
+            int(request_timeout * 1000),
+            deadline=probe_deadline,
+            timeout=16,
         )
         if not isinstance(result, dict):
             record_check("authentication", "authorization", "unavailable")
@@ -312,7 +386,7 @@ def read_existing_authorization(
         record_check("authentication", "authorization", "ready")
         # 保留组件原始签名字段；签名处理交给 Hax，不自行生成或修改签名。
         return {key: str(value) for key, value in user.items()}
-    except AuthenticationError:
+    except (AuthenticationError, TimeoutError):
         raise
     except Exception:
         raise AuthenticationError("network_failed") from None
@@ -327,6 +401,7 @@ def read_existing_authorization(
 def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
     """在本轮隔离浏览器中复用已有授权，不发起新的 Telegram 授权。"""
     saved = validate_snapshot(snapshot, expected_client=HAX_CLIENT)
+    require_time()
     install_hax_rules(browser.page)
     cookies = []
     for value in saved["cookies"]:
@@ -334,40 +409,67 @@ def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
         if cookie["expires"] == -1:
             cookie.pop("expires")
         cookies.append(cookie)
+    login_url = HAX_ORIGIN + "/login"
+    started = time.monotonic()
+    window = require_time(timeout or 30)
+    deadline = started + window
+    probe_deadline = deadline if timeout else None
+    reopened = False
+    retry = None
+    cookie_timeout = require_time(5)
     try:
-        browser.page.run_cdp("Network.setCookies", cookies=cookies)
-        browser.open(HAX_ORIGIN + "/login")
+        browser.page.run_cdp("Network.setCookies", cookies=cookies, _timeout=cookie_timeout)
     except Exception:
         raise AuthenticationError("browser_unavailable") from None
-    deadline = time.monotonic() + timeout
+    try:
+        browser.open(login_url, timeout=window)
+    except TimeoutError:
+        raise
+    except Exception:
+        if not timeout or time.monotonic() >= deadline:
+            raise AuthenticationError("browser_unavailable") from None
+        retry = start_retry(RetryStep.HAX_LOGIN)
+        try:
+            browser.open(login_url, timeout=deadline - time.monotonic())
+            reopened = True
+        except TimeoutError:
+            raise
+        except Exception:
+            raise AuthenticationError("browser_unavailable") from None
     challenged = False
     record_check("authentication", "site_widget", "waiting")
     while True:
+        require_time()
         if has_adblock_dialog(browser.page):
             raise AuthenticationError("adblock_detected")
-        configuration = _evaluate(
-            browser.page,
-            """
-            if (location.origin !== 'https://hax.co.id') return null;
-            if ((document.body?.innerText || '').trim() === 'Please disable AdBlock to access this site!') return 'adblock';
-            const element = document.querySelector('[data-telegram-login="LoginHaxBot"]');
-            if (!element) return null;
-            return {bot: element.getAttribute('data-telegram-login'),
-                callback: new URL(element.getAttribute('data-auth-url'), location.href).href,
-                request_access: element.getAttribute('data-request-access')};
-        """,
-        )
+        try:
+            configuration = _evaluate(
+                browser.page,
+                """
+                if (location.origin !== 'https://hax.co.id') return null;
+                if ((document.body?.innerText || '').trim() === 'Please disable AdBlock to access this site!') return 'adblock';
+                const element = document.querySelector('[data-telegram-login="LoginHaxBot"]');
+                if (!element) return null;
+                return {bot: element.getAttribute('data-telegram-login'),
+                    callback: new URL(element.getAttribute('data-auth-url'), location.href).href,
+                    request_access: element.getAttribute('data-request-access')};
+                """,
+                deadline=probe_deadline,
+            )
+        except AuthenticationError:
+            configuration = None
         if configuration == "adblock":
             raise AuthenticationError("adblock_detected")
         if configuration is not None:
             break
-        if hax_status(browser) == "challenge":
+        if hax_status(browser, deadline=probe_deadline) == "challenge":
             challenged = True
             try:
                 browser.click_turnstile()
             except Exception:
                 pass
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if not timeout or now >= deadline:
             record_check(
                 "authentication",
                 "site_widget",
@@ -376,7 +478,17 @@ def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
             raise AuthenticationError(
                 "access_blocked" if challenged else "hax_widget_unverified"
             )
-        time.sleep(0.5)
+        if not reopened and not challenged and window >= 2 and now >= started + window / 2:
+            reopened = True
+            if hax_status(browser, deadline=probe_deadline) == "login_required":
+                retry = start_retry(RetryStep.HAX_LOGIN)
+                try:
+                    browser.open(login_url, timeout=deadline - time.monotonic())
+                except TimeoutError:
+                    raise
+                except Exception:
+                    pass
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
     if (
         not isinstance(configuration, dict)
         or set(configuration) != {"bot", "callback", "request_access"}
@@ -403,6 +515,8 @@ def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
     if not valid:
         record_check("authentication", "callback", "invalid")
         raise AuthenticationError("hax_callback_unverified")
+    if retry:
+        retry.recovered = True
     user = read_existing_authorization(
         browser.page,
         saved["account"]["userId"],
@@ -416,15 +530,16 @@ def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
             configuration["callback"] + "?" + urlencode(user),
         )
     except AuthenticationError:
+        # 回调已交给浏览器时，响应丢失也可能已经登录成功。
         record_check("authentication", "callback", "unavailable")
-        raise AuthenticationError("network_failed") from None
-    if sent is not True:
-        record_check("authentication", "callback", "invalid")
-        raise AuthenticationError("hax_callback_unverified")
-    record_check("authentication", "callback", "sent")
-    deadline = time.monotonic() + timeout
+    else:
+        if sent is not True:
+            record_check("authentication", "callback", "invalid")
+            raise AuthenticationError("hax_callback_unverified")
+        record_check("authentication", "callback", "sent")
+    deadline = time.monotonic() + require_time(timeout or 5)
     while True:
-        status = hax_status(browser)
+        status = hax_status(browser, deadline=deadline if timeout else None)
         if status == "authenticated":
             record_check("authentication", "callback", "ready")
             return
@@ -436,7 +551,7 @@ def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
                 browser.click_turnstile()
             except Exception:
                 pass
-        if time.monotonic() >= deadline:
+        if not timeout or time.monotonic() >= deadline:
             record_check(
                 "authentication",
                 "callback",
@@ -445,4 +560,4 @@ def restore_hax(browser: Page, snapshot: object, timeout: float = 60) -> None:
             raise AuthenticationError(
                 "access_blocked" if challenged else "hax_page_unverified"
             )
-        time.sleep(0.5)
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))

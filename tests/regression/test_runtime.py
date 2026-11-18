@@ -60,6 +60,19 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotIn(value, output)
         self.assertNotIn("Traceback", output)
 
+    def test_actions_runtime_does_not_forward_local_force_to_worker(self) -> None:
+        self.env.update(GITHUB_ACTIONS="true", GITHUB_REF="refs/heads/master", HAX_FORCE_RENEWAL="1")
+        self.worker(
+            "from scripts.renewal_config import worker_account\n"
+            "assert 'HAX_FORCE_RENEWAL' not in os.environ\n"
+            "account = worker_account(os.environ)\n"
+            "sys.exit(publish_results([{'username': account['phone'], 'servers': [], "
+            "'public_state': 'no_vps'}], 'hax'))\n"
+        )
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no_vps=1", result.stdout)
+
     def test_fixed_navigation_conditions_reach_runtime_without_page_text(self) -> None:
         sample = json.dumps(navigation_sample("loading"))
         self.worker(

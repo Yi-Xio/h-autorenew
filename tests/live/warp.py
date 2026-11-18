@@ -12,6 +12,8 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any
 
+from scripts.hax_renewal.retry_report import RetryStep, start_retry
+from scripts.hax_renewal.timing import remaining_time, require_time
 from scripts.public_report import WARP_FAILURE_REASONS
 
 
@@ -37,6 +39,10 @@ def main(arguments: list[str] | None = None) -> int:
             time=time,
             IPv4Address=IPv4Address,
             WARP_CMD_TIMEOUT=10,
+            RetryStep=RetryStep,
+            start_retry=start_retry,
+            remaining_time=remaining_time,
+            require_time=require_time,
         )
         exec(
             compile(ast.Module(body=nodes, type_ignores=[]), "hax-renew.py", "exec"),

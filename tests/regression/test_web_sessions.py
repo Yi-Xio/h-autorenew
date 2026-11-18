@@ -66,7 +66,7 @@ class FakePage:
         self.kind = kind
         self.ready = ready
         self.browser = SimpleNamespace(
-            new_tab=lambda url: WidgetPage(
+            new_tab=lambda url=None: WidgetPage(
                 payload=None
                 if ready
                 else {"origin": "https://hax.co.id", "user": False}
