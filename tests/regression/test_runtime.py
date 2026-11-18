@@ -60,18 +60,32 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotIn(value, output)
         self.assertNotIn("Traceback", output)
 
-    def test_actions_runtime_does_not_forward_local_force_to_worker(self) -> None:
-        self.env.update(GITHUB_ACTIONS="true", GITHUB_REF="refs/heads/master", HAX_FORCE_RENEWAL="1")
-        self.worker(
-            "from scripts.renewal_config import worker_account\n"
-            "assert 'HAX_FORCE_RENEWAL' not in os.environ\n"
-            "account = worker_account(os.environ)\n"
-            "sys.exit(publish_results([{'username': account['phone'], 'servers': [], "
-            "'public_state': 'no_vps'}], 'hax'))\n"
+    def test_only_explicit_manual_choice_disables_the_workers_expiry_threshold(self) -> None:
+        self.env.update(
+            GITHUB_ACTIONS="true", GITHUB_REF="refs/heads/master",
+            HAX_FORCE_RENEWAL="1", WOIDEN_FORCE_RENEWAL="1",
         )
-        result = self.invoke()
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("no_vps=1", result.stdout)
+        for platform in ("hax", "woiden"):
+            for event, mode, force in (
+                ("workflow_dispatch", "检查到期日", False),
+                ("workflow_dispatch", "不检查到期日", True),
+                ("schedule", "不检查到期日", False),
+            ):
+                with self.subTest(platform=platform, event=event, mode=mode):
+                    self.env.update(GITHUB_EVENT_NAME=event, RENEWAL_EXPIRY_MODE=mode)
+                    expected = {platform.upper() + "_FORCE_RENEWAL": "1"} if force else {}
+                    self.worker(
+                        "flags = {key: value for key, value in os.environ.items() "
+                        "if key in {'HAX_FORCE_RENEWAL', 'WOIDEN_FORCE_RENEWAL'}}\n"
+                        f"assert flags == {expected!r}\n"
+                        "assert 'RENEWAL_EXPIRY_MODE' not in os.environ\n"
+                        "sys.exit(publish_results([{'username': '+1-5550001234', 'servers': [], "
+                        f"'public_state': 'no_vps'}}], {platform!r}))\n",
+                        platform,
+                    )
+                    result = self.invoke(platform)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("no_vps=1", result.stdout)
 
     def test_fixed_navigation_conditions_reach_runtime_without_page_text(self) -> None:
         sample = json.dumps(navigation_sample("loading"))
@@ -424,12 +438,14 @@ sys.exit(publish_results([{"username": "+1-5550001234", "servers": [], "public_s
         saved.write_text("existing-result")
         self.worker("""
 assert os.environ["HAX_AUTH_CHECK_ONLY"] == "1"
+assert "HAX_FORCE_RENEWAL" not in os.environ
 from scripts.public_report import authentication_result, record_check
 publish_progress('preparing')
 record_check('authentication', 'callback', 'ready')
 Path(os.environ["PUBLIC_REPORT_FILE"]).write_text(json.dumps(authentication_result('valid', 'none')))
 """)
         self.env["GITHUB_STEP_SUMMARY"] = str(self.root / "summary.md")
+        self.env["HAX_FORCE_RENEWAL"] = "1"
         result = subprocess.run(
             [sys.executable, "-m", "scripts.actions_runtime", "hax", "--check-auth"],
             cwd=self.root,

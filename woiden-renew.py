@@ -84,7 +84,11 @@ MAX_WARP_ROTATE_ATTEMPTS = int(os.environ.get("MAX_WARP_ROTATE_ATTEMPTS", "20").
 WARP_CMD_TIMEOUT = int(os.environ.get("WARP_CMD_TIMEOUT", "10").strip())
 # 【到期日门槛】VPS 剩余有效期 ≥ 该天数时跳过续期流程，只提示"有效期充足，
 # 无需续期"。默认 2 天，可通过环境变量 WOIDEN_MIN_VALID_DAYS 调整（hax 保持 5 天）。
-MIN_VALID_DAYS = int(os.environ.get("WOIDEN_MIN_VALID_DAYS", "2").strip())
+MIN_VALID_DAYS = (
+    None
+    if os.environ.get("WOIDEN_FORCE_RENEWAL") == "1"
+    else int(os.environ.get("WOIDEN_MIN_VALID_DAYS", "2").strip())
+)
 
 DEBUG = os.environ.get("DEBUG_FLAG", "0").strip() == "1"
 
@@ -3106,7 +3110,11 @@ def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
     # ── 到期日充足判断：剩余天数 ≥ MIN_VALID_DAYS 时跳过续期 ──────────
     valid_date = _parse_iso_date(old_valid_until)
     base_date = _parse_iso_date(server_info.get("current_date", "")) or cn_now().date()
-    if valid_date is not None and (valid_date - base_date).days >= MIN_VALID_DAYS:
+    if (
+        MIN_VALID_DAYS is not None
+        and valid_date is not None
+        and (valid_date - base_date).days >= MIN_VALID_DAYS
+    ):
         days_left = (valid_date - base_date).days
         result = {
             "server_id": sid, "server_name": server_name, "hostname": hostname,

@@ -18,7 +18,12 @@ from scripts.accounts import (
 from scripts.renewal_config import account_masks, cache_identity, configured_accounts
 from scripts.public_report import iso_date
 from scripts.job_summary import render_summary, write_summary
-from scripts.state import CACHE_FILE, prepare_cached_state, read_cached_state
+from scripts.state import (
+    CACHE_FILE,
+    manual_renewal_ignores_expiry,
+    prepare_cached_state,
+    read_cached_state,
+)
 
 
 def build_matrix(platform: str = "woiden") -> None:
@@ -61,10 +66,14 @@ def setup_cache(platform: str) -> None:
 
 
 def check_account(platform: str) -> None:
-    """按恢复的本账号日期预筛；缓存不可用时执行网站检查。"""
+    """根据手动选项或恢复的账号到期日判断是否启动续期脚本。"""
     fields = runtime_account(platform, dict(os.environ), with_notification=False)
     index = fields.index
     register_masks(fields.masks())
+    if manual_renewal_ignores_expiry(os.environ):
+        _outputs({"should_run": "true", "days_left": "", "cache_status": "manual_no_expiry"})
+        print(f"account={index} stage=check cache=manual_no_expiry result=needed")
+        return
     skip_days = int(os.environ.get("SKIP_DAYS", "5" if platform == "hax" else "2"))
     if not 1 <= skip_days <= 365:
         raise ValueError("invalid_threshold")

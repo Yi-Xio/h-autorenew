@@ -23,6 +23,7 @@ from scripts.job_summary import (
     validate_authentication_result,
 )
 from scripts.public_report import iso_date, validate_details, validate_snapshot
+from scripts.state import manual_renewal_ignores_expiry
 
 
 class RunCancelled(Exception):
@@ -60,8 +61,15 @@ def run(platform: str, context: Dict[str, Any], check_only: bool = False) -> int
             report = private / "report.json"
             environment = _worker_environment(fields, private, report)
             environment["HAX_AUTH_CHECK_ONLY"] = "1" if check_only else "0"
-            if platform != "hax" or check_only or os.environ.get("GITHUB_ACTIONS") == "true":
-                environment.pop("HAX_FORCE_RENEWAL", None)
+            hax_local_force = (
+                platform == "hax"
+                and os.environ.get("GITHUB_ACTIONS") != "true"
+                and environment.get("HAX_FORCE_RENEWAL") == "1"
+            )
+            environment.pop("HAX_FORCE_RENEWAL", None)
+            environment.pop("WOIDEN_FORCE_RENEWAL", None)
+            if not check_only and (hax_local_force or manual_renewal_ignores_expiry(os.environ)):
+                environment[f"{platform.upper()}_FORCE_RENEWAL"] = "1"
             binary = root / "sing-box"
             if binary.is_file():
                 (private / "sing-box").symlink_to(binary)

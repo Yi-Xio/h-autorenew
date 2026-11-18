@@ -2,13 +2,22 @@
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from scripts.accounts import Account, public_account_id, state_key
 from scripts.public_report import iso_date
 
 CACHE_FILE = Path("output/renewal-state.json")
+
+
+def manual_renewal_ignores_expiry(environment: Mapping[str, str]) -> bool:
+    """仅在 Actions 手动选择「不检查到期日」时跳过到期日判断。"""
+    return (
+        environment.get("GITHUB_ACTIONS") == "true"
+        and environment.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and environment.get("RENEWAL_EXPIRY_MODE") == "不检查到期日"
+    )
 
 
 def read_observed_state(path: Path, fields: Sequence[str] | Account) -> str | None:

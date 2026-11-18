@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '8 */12 * * *'
   workflow_dispatch:
+    inputs:
+      expiry_mode:
+        description: 续期方式
+        type: choice
+        required: true
+        default: 检查到期日
+        options:
+          - 检查到期日
+          - 不检查到期日
 
 permissions:
   contents: read
@@ -49,6 +58,7 @@ jobs:
       RENEWAL_ACCOUNT_KEY: ${{ matrix.key }}
       DEBUG_FLAG: '0'
       PUBLIC_SUMMARY_DEFERRED: '1'
+      RENEWAL_EXPIRY_MODE: ${{ inputs.expiry_mode }}
       SKIP_DAYS: '5'
       HAX_MIN_VALID_DAYS: '5'
     steps:

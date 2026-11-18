@@ -288,6 +288,7 @@ def render_summary(
         "invalid": "记录无效，改为检查网站",
         "restore_failed": "恢复失败，改为检查网站",
         "forced": "强制实测，本地预筛已跳过",
+        "manual_no_expiry": "手动选择不检查到期日",
     }.get(environ.get("CACHE_STATUS", ""), "未完成")
     cache_save = _cache_save(environ, skipped)
     title = f"{'Hax' if platform == 'hax' else 'Woiden'} · {'账号 #' + str(index) if index else '账号配置'}"

@@ -61,7 +61,11 @@ class WorkflowTests(unittest.TestCase):
             text=True,
             timeout=10,
         )
-        self.assert_private(result.stdout + result.stderr)
+        # Actions 会消费遮罩指令，核对的是随后可见的日志与步骤输出。
+        visible = "\n".join(
+            line for line in result.stdout.splitlines() if not line.startswith("::add-mask::")
+        )
+        self.assert_private(visible + result.stderr)
         if (self.root / "output.txt").exists():
             self.assert_private((self.root / "output.txt").read_text())
         return result
@@ -201,6 +205,30 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.invoke().returncode, 0)
         self.assertEqual(self.outputs()["should_run"], "true")
         self.assertEqual(self.outputs()["cache_status"], "restore_failed")
+
+    def test_only_explicit_manual_choice_runs_with_sufficient_cached_expiry(self) -> None:
+        self.env.update(GITHUB_ACTIONS="true", GITHUB_REF="refs/heads/master")
+        for platform in ("hax", "woiden"):
+            self.cached("2099-12-31", platform)
+            saved = self.cache.read_bytes()
+            for event, mode, should_run in (
+                ("workflow_dispatch", "检查到期日", False),
+                ("workflow_dispatch", "", False),
+                ("workflow_dispatch", "不检查到期日", True),
+                ("schedule", "不检查到期日", False),
+            ):
+                with self.subTest(platform=platform, event=event, mode=mode):
+                    self.env.update(GITHUB_EVENT_NAME=event, RENEWAL_EXPIRY_MODE=mode)
+                    result = self.invoke(platform=platform)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    outputs = self.outputs()
+                    self.assertEqual(outputs["should_run"], "true" if should_run else "false")
+                    self.assertEqual(
+                        outputs["cache_status"], "manual_no_expiry" if should_run else "hit"
+                    )
+                    if should_run:
+                        self.assertEqual(outputs["days_left"], "")
+                    self.assertEqual(self.cache.read_bytes(), saved)
 
     def test_no_vps_state_still_runs_to_check_current_site_status(self) -> None:
         self.cached("NOVPS")
