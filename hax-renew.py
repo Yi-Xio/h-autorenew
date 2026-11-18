@@ -3,15 +3,14 @@
 
 import os, sys, time, platform, requests, re, json, subprocess, socket
 os.environ["PATH"] = os.path.expanduser("~/bin") + os.pathsep + os.environ.get("PATH", "")
-import tempfile, html as html_mod, random
-from datetime import datetime, timezone, timedelta, date
+import tempfile, html as html_mod
+from datetime import datetime, timezone
 from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from DrissionPage import ChromiumPage, ChromiumOptions
 from gen_singbox_config import setup_proxy
 from scripts.public_report import (
-    WARP_FAILURE_REASONS,
     authentication_result,
     publish_progress,
     publish_results,
@@ -25,6 +24,17 @@ from scripts.renewal_config import notification_config, worker_account
 from scripts.web_auth import AuthenticationError, TelegramWeb, new_telegram_reader
 from scripts.hax_login import hax_status, restore_hax, wait_hax_navigation
 from scripts.browser_setup import install_hax_rules
+from scripts.hax_renewal.flow import (
+    CN_TZ,
+    ArithmeticCaptchaUnavailable,
+    CaptchaBlocked,
+    RenewalServices,
+    WarpError,
+    cn_now,
+    run_renewal,
+    safe_sid_for_filename,
+)
+from scripts.hax_renewal.operations import HAX_VPS_RENEW_CODE_URL
 from scripts.hax_result import RenewalFeedback
 from scripts.job_summary import REASON_HINTS, REASON_LABELS
 
@@ -96,29 +106,11 @@ def _dbg(msg):
     if DEBUG:
         print(f"  [DEBUG] {msg}")
 
-CN_TZ = timezone(timedelta(hours=8))
-
 HAX_BASE_URL = "https://hax.co.id"
 HAX_TITLE = "hax.co.id"
 HAX_VPS_INFO_URL = f"{HAX_BASE_URL}/vps-info"
-HAX_VPS_RENEW_URL = f"{HAX_BASE_URL}/vps-renew"
-HAX_VPS_RENEW_CODE_URL = f"{HAX_BASE_URL}/vps-renew-code"
 HAX_VPS_STATUS_URL = f"{HAX_BASE_URL}/vps-status"
 HAX_VPS_CONTROL_URL = f"{HAX_BASE_URL}/vps-control"
-
-def cn_now() -> datetime:
-    return datetime.now(CN_TZ)
-
-
-def _parse_iso_date(s: str):
-    """解析 "YYYY-MM-DD" 为 date，失败返回 None。"""
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return None
-
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  reCAPTCHA 语音识别求解器 (适配 DrissionPage)   ║
@@ -239,28 +231,9 @@ class DPBrowser:
         try: self.page.quit()
         except Exception: pass
 
-class WarpError(RuntimeError):
-    """WARP 失败只携带固定原因，不保留命令输出或出口信息。"""
-
-    def __init__(self, reason: str):
-        if reason not in WARP_FAILURE_REASONS:
-            raise ValueError("invalid_warp_reason")
-        self.reason = reason
-        super().__init__(REASON_LABELS[reason])
-
-
-class CaptchaBlocked(Exception):
-    """验证码处理未完成，由调用方决定是否恢复。"""
-    pass
-
 class CaptchaAudioUnavailable(CaptchaBlocked):
     """无法取得或处理 reCAPTCHA 音频挑战。"""
     pass
-
-class ArithmeticCaptchaUnavailable(CaptchaBlocked):
-    """算术验证码无法识别或填入。"""
-    pass
-
 
 def parse_arithmetic_text(text: str):
     """解析页面文字算式，例如 4 × 6 =、12 + 3 =。"""
@@ -942,7 +915,7 @@ class ArithmeticCaptchaSolver(CaptchaSolver):
 _arith_solver_singleton: Optional[ArithmeticCaptchaSolver] = None
 
 
-def _get_arith_solver(proxy: str = None) -> ArithmeticCaptchaSolver:
+def _get_arith_solver(proxy: str | None = None) -> ArithmeticCaptchaSolver:
     """复用同一个 DdddOcr 实例（模型加载较重），仅更新代理配置。"""
     global _arith_solver_singleton
     if _arith_solver_singleton is None:
@@ -952,7 +925,7 @@ def _get_arith_solver(proxy: str = None) -> ArithmeticCaptchaSolver:
     return _arith_solver_singleton
 
 
-def solve_arithmetic_captcha(browser, proxy: str = None, scene: str = "") -> None:
+def solve_arithmetic_captcha(browser, proxy: str | None = None, scene: str = "") -> None:
     """四则运算验证码统一求解入口。
 
     页面没有算术验证码时静默返回；检测到但求解失败时抛出
@@ -1007,12 +980,6 @@ def mask_phone(phone: str) -> str:
         if len(p) <= 6:
             return p
         return f"{p[:2]}{'*' * (len(p) - 6)}{p[-4:]}"
-
-def safe_sid_for_filename(sid: str) -> str:
-    s = str(sid)
-    if len(s) <= 3:
-        return s
-    return f"{s[0]}{'*' * (len(s) - 3)}{s[-2:]}"
 
 def is_linux():
     return platform.system().lower() == "linux"
@@ -1616,10 +1583,10 @@ def hax_get_vps_info(browser, idx: int) -> Tuple[List[Dict[str, str]], str, Opti
     return servers, "", screenshot
 
 
-def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = None,
-                      max_retries: int = 5) -> None:
+def _prepare_final_form(browser, idx: int, sid_f: str, proxy: str | None = None,
+                        max_retries: int = 5) -> bool:
     """
-    在 vps-renew-code 页面：解 reCAPTCHA → 输入验证码 → 提交最终按钮。
+    在 vps-renew-code 页面完成输入业务码前的检查。
 
     顺序与 auto_hax_private 参考版一致：先解 reCAPTCHA 再输入验证码。
     CaptchaBlocked 时换 IP + 刷新页面重试，复用同一个 TG 验证码（约 3 分钟有效）。
@@ -1743,95 +1710,13 @@ def _submit_code_page(browser, code: str, idx: int, sid_f: str, proxy: str = Non
                 continue
             else:
                 print("  [ERROR] 浏览器驱动 已断开且重试耗尽")
-                break
-
-        # reCAPTCHA 解完后，输入续期验证码（TG bot 发来的）
-        print("  [INFO] 输入续期验证码...")
-        try:
-            browser.execute_script(f'''
-                var input = document.querySelector('input[name="code"], input[name="verification_code"], input[name="otp"]');
-                if (input) {{
-                    input.value = '{code}';
-                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                }}
-            ''')
-            print("  [INFO] 验证码已输入")
-        except Exception as e:
-            print(f"  [ERROR] 验证码输入失败: {e}")
-            raise
-
-        time.sleep(1)
-
-        # 滚动到 Renew VPS 按钮区域并截图
-        try:
-            browser.execute_script('''
-                (function() {
-                    var els = document.querySelectorAll('label, h2, h3, h4, div, span, p');
-                    for (var i = 0; i < els.length; i++) {
-                        if (els[i].textContent.trim() === 'Renew VPS') {
-                            els[i].scrollIntoView({block: "start", behavior: "instant"});
-                            return;
-                        }
-                    }
-                    window.scrollTo(0, document.body.scrollHeight);
-                })()
-            ''')
-            time.sleep(0.5)
-        except Exception:
-            pass
-        safe_screenshot(browser, shot(idx, f"renew_{sid_f}_complete_code"))
-
-        # 只用真实鼠标点击（用户实证：之前跑出进度条的成功轮次就是真实点击）。
-        # 不做任何 JS click / XHR POST / form.submit 兜底——那些反而绕过了
-        # 网站对「真人交互」的判定，导致 POST 被服务器无视。
-        try:
-            # 点击前：滚动按钮到视口中央 + 清理广告浮层（含 24h 看广告弹窗）
-            removeAds(browser)
-            browser.execute_script('''
-                (function() {
-                    var btn = document.querySelector('button[name="submit_button"], button[data-callback="onSubmit"]');
-                    if (btn) btn.scrollIntoView({block: 'center', behavior: 'instant'});
-                })();
-            ''')
-            time.sleep(1)
-            previous_feedback = getattr(browser, 'renewal_submission', None)
-            if previous_feedback:
-                previous_feedback.close()
-            browser.renewal_submission = None
-            browser.renewal_submission = RenewalFeedback(browser.page)
-            clicked = False
-            for locator in ('css:button[name="submit_button"]',
-                            'css:button[data-callback="onSubmit"]',
-                            'css:button.btn-primary',
-                            'css:button[type="submit"]',
-                            'css:input[type="submit"]'):
-                try:
-                    element = browser.page.ele(locator, timeout=2)
-                    if element:
-                        browser.renewal_submission.activate()
-                        element.click()
-                        clicked = True
-                        print(f"  [INFO] 真实元素点击成功: {locator}")
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                print("  [ERROR] 所有按钮定位器都未命中，未发生任何点击")
-        except Exception as e:
-            print(f"  [ERROR] 续期的最终按钮点击出错: {e}")
-
-        # 点击后 3 秒截提交结果页，再由外层继续等待并跳转 info。
-        time.sleep(3)
-        safe_screenshot(browser, shot(idx, f"renew_{sid_f}_after_final_submit"))
-        break  # 提交动作已完成，交给外层检查结果
+                return False
+        return True
+    return False
 
 
-def _renew_fill_form(browser, idx: int, sid_f: str) -> None:
-    """打开 /vps-renew/ 并填写表单：web_address + agreement + Turnstile + 点击提交"""
-    browser.open(HAX_VPS_RENEW_URL)
-    time.sleep(5)
-
+def _prepare_initial_page(browser) -> None:
+    """沿用现有的初始续期页面准备。"""
     # Cloudflare 绕过
     for attempt in range(6):
         src = browser.get_page_source()
@@ -1849,71 +1734,15 @@ def _renew_fill_form(browser, idx: int, sid_f: str) -> None:
     dismiss_cookie_only(browser)
     removeAds(browser)
 
-    # 填 web_address（模拟真实用户输入）
-    web_addr = "hax.co.id"
-    print(f"  [INFO] 填写 web_address: '{web_addr}'")
-    try:
-        browser.execute_script('''
-            var input = document.getElementById('web_address') || document.querySelector('input[name="web_address"]');
-            if (input) {
-                input.value = '';
-                input.focus();
-                input.dispatchEvent(new Event('focus', {bubbles: true}));
-            }
-        ''')
-        time.sleep(0.3)
-        for ch in web_addr:
-            browser.execute_script(f'''
-                var input = document.getElementById('web_address') || document.querySelector('input[name="web_address"]');
-                if (input) {{
-                    input.value += '{ch}';
-                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                }}
-            ''')
-            time.sleep(random.uniform(0.05, 0.15))
-        print("  [INFO] web_address 已填写")
-    except Exception as e:
-        print(f"  [WARN] web_address 填写失败: {e}")
 
-    # 勾 agreement
-    print("  [INFO] 勾选 agreement...")
-    try:
-        browser.execute_script('''
-            var cb = document.querySelector('input[name="agreement"]');
-            if (cb && !cb.checked) {
-                cb.click();
-                cb.dispatchEvent(new Event('change', {bubbles: true}));
-            }
-        ''')
-        time.sleep(0.5)
-        checked = browser.execute_script('return document.querySelector(\'input[name="agreement"]\') ? document.querySelector(\'input[name="agreement"]\').checked : false;')
-        print(f"  [INFO] agreement 状态: {'✅ 已勾选' if checked else '❌ 未勾选'}")
-    except Exception as e:
-        print(f"  [WARN] agreement 勾选失败: {e}")
-
+def _check_initial_form(browser, idx: int) -> None:
+    """核对初始续期表单的站点验证状态。"""
     time.sleep(2)
 
     # 解 Turnstile：若人机验证未通过，本 IP 上提交必失败，直接换 IP 重试，避免无效提交。
     if not hax_handle_turnstile(browser, idx):
         raise CaptchaBlocked("renew 表单 Turnstile/人机验证未通过")
     time.sleep(2)
-
-    # 提交（点击 Renew VPS 按钮）
-    safe_screenshot(browser, shot(idx, f"renew_{sid_f}_before_submit"))
-    print("  [INFO] 点击 Renew VPS...")
-    try:
-        browser.execute_script('''
-            var btn = document.querySelector('button[name="submit_button"]');
-            if (btn) btn.click();
-        ''')
-        print("  [INFO] Renew VPS 已点击")
-    except Exception as e:
-        print(f"  [ERROR] 提交失败: {e}")
-        raise
-
-    time.sleep(5)
-    safe_screenshot(browser, shot(idx, f"renew_{sid_f}_after_submit"))
 
 
 def handoff_browser_to_warp(browser, target_url: Optional[str] = None) -> bool:
@@ -1970,98 +1799,8 @@ def handoff_browser_to_warp(browser, target_url: Optional[str] = None) -> bool:
         return False
 
 
-def _renew_navigate_to_code_page(browser, idx: int, sid_f: str, proxy: Optional[str] = None,
-                                solve_arithmetic: bool = False) -> None:
-    """等待 response，确认并点击 INPUT RENEW CODE，验证已进入验证码页。"""
-    print("  [INFO] 等待验证码页面入口...")
-    deadline = time.time() + 30
-    link_info = None
-    while time.time() < deadline:
-        try:
-            link_info = browser.execute_script('''
-                return (function() {
-                    var resp = document.getElementById('response');
-                    if (!resp || resp.innerHTML.length <= 10) return null;
-                    var link = resp.querySelector('a[href*="renew-code"]');
-                    if (!link) return null;
-                    return {href: link.href || '', text: (link.textContent || '').trim()};
-                })()
-            ''')
-            if link_info:
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-    if not link_info:
-        raise RuntimeError("30 秒内未找到 INPUT RENEW CODE 链接")
-
-    before_url = browser.get_current_url()
-    print(f"  [INFO] 找到 INPUT RENEW CODE: {link_info.get('text', '')!r}")
-    clicked = browser.execute_script('''
-        return (function() {
-            var resp = document.getElementById('response');
-            var link = resp && resp.querySelector('a[href*="renew-code"]');
-            if (!link) return false;
-            link.click();
-            return true;
-        })()
-    ''')
-    if not clicked:
-        raise RuntimeError("INPUT RENEW CODE 链接点击失败")
-
-    deadline = time.time() + 20
-    entered = False
-    while time.time() < deadline:
-        try:
-            url = browser.get_current_url()
-            entered = bool(
-                'renew-code' in url.lower()
-                or browser.execute_script('''
-                    return !!(
-                        document.querySelector('.col-sm-3 img') &&
-                        document.querySelectorAll('.col-sm-3 img').length >= 2
-                    );
-                ''')
-            )
-            if entered:
-                print(f"  [INFO] INPUT RENEW CODE 点击成功，已进入验证码页: {url}")
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-    if not entered:
-        raise RuntimeError(
-            f"INPUT RENEW CODE 已点击，但 20 秒内未进入验证码页 "
-            f"(before={before_url}, after={browser.get_current_url()})"
-        )
-
-    try:
-        browser.execute_script('''
-            (function() {
-                var el = document.querySelector('input[name="code"]')
-                      || document.querySelector('input[type="text"]')
-                      || document.querySelector('.col-sm-3 img')
-                      || document.querySelector('form');
-                if (el) el.scrollIntoView({block: "center", behavior: "instant"});
-            })()
-        ''')
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    if solve_arithmetic:
-        solve_arithmetic_captcha(browser, proxy=proxy, scene="验证码页进入后")
-
-
-def _renew_get_code(reader) -> str:
-    """从固定业务会话等待本轮新码，不输出验证码。"""
-    return reader.wait_for_code(timeout=150)
-
-
 def _renew_refresh_code_page_after_captcha(browser, idx: int, sid_f: str,
-                                           proxy: str = None) -> bool:
+                                           proxy: str | None = None) -> bool:
     """服务器拒绝 captcha 后换 WARP IP，并重新准备验证码页面。"""
     print("  [INFO] 服务器拒绝 captcha，立即切换 WARP IP...")
     restart_warp()
@@ -2092,61 +1831,6 @@ def _renew_refresh_code_page_after_captcha(browser, idx: int, sid_f: str,
         return False
 
 
-def _renew_capture_final_info(browser, result: dict, old_valid_until: str) -> None:
-    """无论续期成败，最后回到 VPS info 页面并以该页截图/到期日为准。"""
-    result["info_valid_until"] = ""
-    result["screenshot"] = None
-    result["vps_info_screenshot"] = ""
-    try:
-        servers, error, screenshot = hax_get_vps_info(browser, result.get("_idx", 0))
-        if screenshot:
-            result["screenshot"] = screenshot
-            result["vps_info_screenshot"] = screenshot
-        sid = str(result.get("server_id", ""))
-        current = next((s for s in servers if str(s.get("id", "")) == sid), None)
-        if current:
-            new_valid = current.get("valid_until", "")
-            if new_valid:
-                result["info_valid_until"] = new_valid
-                result["new_valid_until"] = new_valid
-                result["expiry_info"] = f"{old_valid_until} → {new_valid}" if old_valid_until else f"新到期日: {new_valid}"
-                print(f"  [INFO] info 页面到期日对比: {old_valid_until} → {new_valid}")
-                if not result.get("success") and old_valid_until and new_valid != old_valid_until:
-                    result["success"] = True
-                    result["message"] = "续期成功（info 页面到期时间已更新）"
-            result["status"] = current.get("status", result.get("status", ""))
-            result["location"] = current.get("location", result.get("location", ""))
-            result["hostname"] = current.get("hostname", result.get("hostname", ""))
-        elif error:
-            print(f"  [WARN] 最终 info 页面未找到服务器: {error}")
-    except Exception as e:
-        print(f"  [WARN] 最终跳转 info 页面失败: {type(e).__name__}: {e}")
-
-
-def _drain_alerts(browser) -> str:
-    """等待并点掉页面上所有 JS alert，返回最后一条弹窗文本。
-
-    hax 提交续期后用 alert 弹结果（如 "Your VPS has been renewed until ..."），
-    不处理会阻塞 DrissionPage 所有后续操作（"存在未处理的提示框"）。
-    """
-    texts = []
-    page = browser.page
-    for _ in range(30):  # 最多等 ~15 秒
-        try:
-            t = page.handle_alert(accept=True, timeout=0.5)
-            if isinstance(t, str):
-                texts.append(t)
-                print(f"  [INFO] 已处理弹窗: {t[:120]}")
-                time.sleep(0.5)
-                continue
-        except Exception:
-            pass
-        if texts:
-            break
-        time.sleep(0.5)
-    return texts[-1] if texts else ""
-
-
 def _explain_failure(resp_text: str) -> str:
     """把服务端失败话术翻译成更明确的续期失败原因（用于回传 TG 通知）。"""
     t = (resp_text or "").lower()
@@ -2159,297 +1843,58 @@ def _explain_failure(resp_text: str) -> str:
     return f"续期失败: {resp_text}" if resp_text else "续期结果不确定"
 
 
-def _renew_parse_result(browser, result: dict, old_valid_until: str) -> bool:
-    """以本轮真实提交后的站点成功提示为主，另行核对信息页日期。"""
-    # Hax 用原生 alert 显示结果；先处理它，避免阻塞后续页面操作。
-    # 观察器在最终按钮点击前启用，只保留本轮提示的分类和日期。
-    try:
-        _drain_alerts(browser)
-    except Exception as e:
-        print(f"  [WARN] 处理弹窗异常: {type(e).__name__}: {e}")
-    tracker = getattr(browser, "renewal_submission", None)
-    feedback = dict(status="unknown", date="", source="none", reason="none")
-    attempted = bool(tracker and tracker.active)
-    try:
-        for attempt in range(6):
-            if tracker:
-                feedback = tracker.read()
-            if feedback["status"] != "unknown" or not attempted:
-                break
-            if attempt < 5:
-                time.sleep(4)
-    finally:
-        if tracker:
-            tracker.close()
-        browser.renewal_submission = None
+def _prepare_warp_page(browser, idx: int, sid_f: str, proxy: str | None) -> None:
+    """按现有流程准备 WARP 浏览器中的码页。"""
+    # 新浏览器重新打开页面后，验证码图片和 Turnstile 都是新的，不能复用旧页面状态。
+    for cf_attempt in range(6):
+        src = browser.get_page_source()
+        title = (browser.get_title() or "").lower()
+        is_cf = any(i in src for i in ["Just a moment", "Verify you are human"]) or "just a moment" in title
+        if not is_cf:
+            break
+        print(f"  [INFO] WARP 直连页面处理 Cloudflare ({cf_attempt + 1}/6)...")
+        try:
+            browser.click_turnstile()
+        except Exception:
+            pass
+        time.sleep(6)
+    dismiss_cookie_only(browser)
+    removeAds(browser)
+    solve_arithmetic_captcha(browser, proxy=proxy, scene="WARP直连页")
+    safe_screenshot(browser, shot(idx, f"renew_{sid_f}_warp_final_page_ready"))
+    print("  [INFO] ✅ 最终续期页面已切换为 WARP 直连并重新完成算术验证码")
 
-    result["feedback_status"] = feedback["status"]
-    result["submission_attempted"] = attempted
-    confirmed = feedback["status"] == "success"
-    if confirmed:
-        new_valid = feedback["date"]
-        result["banner_new_valid_until"] = new_valid
-        result["new_valid_until"] = new_valid
-        result["expiry_info"] = f"{old_valid_until} → {new_valid}" if old_valid_until else f"新到期日: {new_valid}"
-        result["message"] = "续期成功"
-        print("  [INFO] 已核实本轮站点续期成功提示")
-    else:
-        messages = {
-            "code": "续期失败: 验证码错误或已失效",
-            "captcha": "续期失败: captcha 被服务器拒绝",
-            "rejected": "续期失败: 网站拒绝本次操作",
-            "none": "续期结果待核实" if attempted else "未确认最终按钮提交",
-        }
-        result["message"] = messages[feedback["reason"]]
-        if feedback["reason"] == "captcha":
-            record_check("captcha", "site_feedback", "rejected")
-        result["detailMessage"] = ""
-        result["public_reason"] = (
-            "renewal_unverified" if attempted and feedback["status"] == "unknown"
-            else "captcha_failed" if feedback["reason"] == "captcha"
-            else "renewal_failed"
-        )
-        print(f"  [WARN] {result['message']}")
 
-    # 最后回到 VPS info 页面，截图和到期日仍以该页为准。
-    # 同一天重复续期可显示成功而日期不变，不把这种情况描述为已增加天数。
-    result["success"] = confirmed
-    message = result["message"]
-    _renew_capture_final_info(browser, result, old_valid_until)
-    result["message"] = message
-    result["success"] = confirmed
-    return confirmed
+def _capture_renewal_page(browser, idx: int, name: str) -> None:
+    """按既有截图规则保存当前页面。"""
+    safe_screenshot(browser, shot(idx, name))
 
 
 def renew(browser, server_info: Dict[str, str], idx: int, phone: str,
           tg_token: str = None, tg_chat: str = None, ip_info: str = "",
           proxy: str = None, phone_mask: str = "") -> Dict[str, Any]:
-    """
-     续期流程，支持重试。
-
-    流程:
-        1. 打开 /vps-renew/
-        2. 填 web_address
-        3. 勾 agreement
-        4. 解 Turnstile
-        5. 提交
-        6. Telegram Web 只从本轮业务消息提取验证码
-        7. 输入验证码 → 提交
-        8. 检查 #response .alert-success 判断续期是否成功
-        9. 从成功提示中提取新到期日
-
-    重试机制:
-        - 外层最多重试 MAX_RENEW_RETRIES_PER_URL 次（可通过环境变量覆盖）
-        - 内层 CaptchaBlocked 时重启 WARP 换 IP，最多 MAX_WARP_RETRIES 次
-        - 任一环节出现 CaptchaBlocked 异常，立即重启 WARP 换 IP
-        - 任一环节出现其他异常，重试当前 URL（不换 IP）
-        - WARP 未就绪或严格换出口失败时记录固定原因并停止本次续期
-        - 任一次成功立即返回 result，不再继续重试
-
-    Args:
-        browser: DrissionPage 浏览器实例
-        server_info: 服务器信息字典（id, name, hostname, valid_until 等）
-        idx: 账号序号，用于截图命名
-        phone: 手机号
-        tg_token: Telegram Bot Token（用于发送通知）
-        tg_chat: Telegram Chat ID（用于发送通知）
-        ip_info: 当前 IP 信息（用于通知）
-        proxy: SOCKS5 代理地址
-        phone_mask: 手机号掩码（用于通知）
-
-    Returns:
-        result 字典，包含 success, message, new_valid_until 等字段
-    """
-    sid = server_info.get("id", "")
-    server_name = server_info.get("name", "Unknown")
-    hostname = server_info.get("hostname", "")
-    old_valid_until = server_info.get("valid_until", "")
-
-    # ── 到期日充足判断：剩余天数 ≥ MIN_VALID_DAYS 时跳过续期 ──────────
-    valid_date = _parse_iso_date(old_valid_until)
-    base_date = _parse_iso_date(server_info.get("current_date", "")) or cn_now().date()
-    if valid_date is not None and (valid_date - base_date).days >= MIN_VALID_DAYS:
-        days_left = (valid_date - base_date).days
-        result = {
-            "server_id": sid, "server_name": server_name, "hostname": hostname,
-            "status": server_info.get("status", ""),
-            "ipv6": server_info.get("ipv6", ""),
-            "location": server_info.get("location", ""),
-            "phoneMask": phone_mask or mask_phone(phone),
-            "success": True, "skipped": True, "days_left": days_left,
-            "message": f"✅ 有效期充足（剩余 {days_left} 天，至 {old_valid_until}），无需续期",
-            "detailMessage": "", "screenshot": None,
-            "warp_swaps": 0, "warp_refresh": 0, "retry_count": 0,
-            "old_valid_until": old_valid_until, "new_valid_until": old_valid_until,
-            "vps_info_screenshot": server_info.get("vps_info_screenshot", ""),
-            "_idx": idx,
-        }
-        print(f"\n{'─'*40}")
-        print(f"  [INFO] ✅ 跳过续期: {server_name} 剩余 {days_left} 天（≥ {MIN_VALID_DAYS} 天），无需续期")
-        print(f"{'─'*40}")
-        notify(result, phone, tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info)
-        return result
-
-    # 记录本次续期过程中的换 IP 次数、warp 刷新次数与外层重试次数
-    get_warp_manager().current_tag = phone_mask or mask_phone(phone)
-    warp_start = get_warp_manager().rotation_count
-    warp_refresh_start = get_warp_manager().warp_refresh_count
-
-    result = {
-        "server_id": sid, "server_name": server_name, "hostname": hostname,
-        "status": server_info.get("status", ""),
-        "ipv6": server_info.get("ipv6", ""),
-        "location": server_info.get("location", ""),
-        "phoneMask": phone_mask or mask_phone(phone),
-        "success": False, "message": "", "detailMessage": "", "screenshot": None,
-        "warp_swaps": 0, "warp_refresh": 0, "retry_count": 0,
-        "old_valid_until": old_valid_until, "new_valid_until": "",
-        "vps_info_screenshot": server_info.get("vps_info_screenshot", ""),
-        "_idx": idx,
-    }
-
-    sid_f = re.sub(r'[^\w]', '_', sid)
-
-    print(f"\n{'─'*40}")
-    print(f"  [INFO] 续期: {server_name} (id={safe_sid_for_filename(sid)})")
-    print(f"{'─'*40}")
-
-    # 算术验证码失败时额外保留一次换 IP 重试机会。
-    max_attempts = MAX_RENEW_RETRIES_PER_URL + 1
-    forced_arithmetic_retry_used = False
-    for renew_attempt in range(1, max_attempts + 1):
-        # 重试时清除上一轮的截图和日期，避免把旧页面当作本次最终结果。
-        result["screenshot"] = None
-        result["vps_info_screenshot"] = ""
-        result["info_valid_until"] = ""
-        result["feedback_status"] = "unknown"
-        result["submission_attempted"] = False
-        if renew_attempt > 1:
-            print(f"  [INFO] 续期重试 {renew_attempt}/{MAX_RENEW_RETRIES_PER_URL}...")
-
-        result["public_reason"] = "renewal_failed"
-        try:
-            # 提交之前记录业务消息基线；不使用历史旧码或操作 Telegram 按钮。
-            browser.telegram_reader.arm()
-            # 1. 填写表单并提交
-            _renew_fill_form(browser, idx, sid_f)
-
-            # 3. 进入验证码页面 + 解算术验证码
-            _renew_navigate_to_code_page(browser, idx, sid_f, proxy)
-
-            # 4. 最终续期页面强制脱离 sing-box，改由系统 WARP 直连。
-            # 入口点击可通过代理完成，但验证码和最后提交必须使用同一 WARP 出口。
-            print("  [INFO] 已进入最终续期页面，切换为 WARP 直连浏览器...")
-            if renew_attempt == 1:
-                ensure_warp_ready()
-            else:
-                restart_warp()
-            if not handoff_browser_to_warp(browser, HAX_VPS_RENEW_CODE_URL):
-                result["public_reason"] = "warp_failed"
-                raise CaptchaBlocked("最终续期页面 WARP 直连浏览器重建失败")
-
-            # 新浏览器重新打开页面后，验证码图片和 Turnstile 都是新的，不能复用旧页面状态。
-            for cf_attempt in range(6):
-                src = browser.get_page_source()
-                title = (browser.get_title() or "").lower()
-                is_cf = any(i in src for i in ["Just a moment", "Verify you are human"]) or "just a moment" in title
-                if not is_cf:
-                    break
-                print(f"  [INFO] WARP 直连页面处理 Cloudflare ({cf_attempt + 1}/6)...")
-                try:
-                    browser.click_turnstile()
-                except Exception:
-                    pass
-                time.sleep(6)
-            dismiss_cookie_only(browser)
-            removeAds(browser)
-            solve_arithmetic_captcha(browser, proxy=proxy, scene="WARP直连页")
-            safe_screenshot(browser, shot(idx, f"renew_{sid_f}_warp_final_page_ready"))
-            print("  [INFO] ✅ 最终续期页面已切换为 WARP 直连并重新完成算术验证码")
-
-            # 5. 获取 TG 验证码
-            result["public_reason"] = "renewal_code_unavailable"
-            code = _renew_get_code(browser.telegram_reader)
-            result["public_reason"] = "renewal_failed"
-
-            # 6. 提交验证码页面 + 检查结果（captcha 错误时内层重试）
-            for code_attempt in range(1, MAX_WARP_RETRIES + 1):
-                # 5a. 提交验证码页面（算术 + reCAPTCHA + 最终提交）
-                _submit_code_page(browser, code, idx, sid_f, proxy)
-
-                # 5b. 检查续期结果
-                if _renew_parse_result(browser, result, old_valid_until):
-                    break  # 成功，退出
-
-                # captcha 错误时，刷新 vps-renew-code 页面重试
-                resp_msg = result.get("message", "")
-                if "captcha" in resp_msg.lower() and code_attempt < MAX_WARP_RETRIES:
-                    print(f"  [INFO] captcha 错误，换 WARP IP 后重试 ({code_attempt}/{MAX_WARP_RETRIES})...")
-                    if _renew_refresh_code_page_after_captcha(browser, idx, sid_f, proxy):
-                        continue  # 新 IP + 新验证码页面后重试 _submit_code_page
-                    result["public_reason"] = "warp_failed"
-                    result["message"] = "续期失败: captcha 被服务器拒绝，WARP 换 IP 失败"
-                    result["detailMessage"] = "captcha 被服务器拒绝，WARP 换 IP 失败"
-                    break
-
-                break  # 非 captcha 错误或重试耗尽，退出内层循环
-
-            if result["success"]:
-                break  # 成功，退出外层重试
-
-            if renew_attempt < MAX_RENEW_RETRIES_PER_URL:
-                print(f"  [INFO] 等待 5s 后重试...")
-                time.sleep(5)
-                continue
-            break
-
-        except WarpError as e:
-            result["public_reason"] = e.reason
-            result["message"] = str(e)
-            break
-        except AuthenticationError as e:
-            result["public_reason"] = e.reason
-            result["message"] = REASON_LABELS[e.reason]
-            break
-        except CaptchaBlocked as e:
-            # 保留验证码失败的具体环节，不由异常类型推断出口被封锁。
-            # 此处保留已有恢复调用；验证码失败类型与换出口条件由后续重试改造统一。
-            # 算术验证码即使到达普通重试上限，也额外保留一次 WARP 重试。
-            is_arithmetic_failure = isinstance(e, ArithmeticCaptchaUnavailable)
-            can_retry = renew_attempt < MAX_RENEW_RETRIES_PER_URL
-            if is_arithmetic_failure and not forced_arithmetic_retry_used:
-                can_retry = True
-                forced_arithmetic_retry_used = True
-            if can_retry:
-                print(f"  [WARN] {type(e).__name__}: {e}")
-                print("  [INFO] 验证码失败，立即切换 WARP IP 后重试...")
-                try:
-                    if restart_warp() and handoff_browser_to_warp(browser):
-                        time.sleep(5)
-                        continue
-                except WarpError as warp_error:
-                    result["public_reason"] = warp_error.reason
-                    result["message"] = str(warp_error)
-                    break
-            if result.get("public_reason") != "warp_failed":
-                result["public_reason"] = "captcha_failed"
-            result["message"] = f"验证码失败: {e}"
-            break
-        except Exception as e:
-            print(f"  [ERROR] 续期异常: {e}")
-            if renew_attempt < MAX_RENEW_RETRIES_PER_URL:
-                print(f"  [INFO] 等待 5s 后重试...")
-                time.sleep(5)
-                continue
-            result["message"] = f"续期异常: {e}"
-            break
-
-    result["warp_swaps"] = get_warp_manager().rotation_count - warp_start
-    result["warp_refresh"] = get_warp_manager().warp_refresh_count - warp_refresh_start
-    result["retry_count"] = max(renew_attempt - 1, 0)
-    print(f"  [STATS][{result.get('phoneMask','')}] 续期重试={result['retry_count']} ip更换={result['warp_swaps']} warp刷新={result['warp_refresh']}")
-
-    print(f"  {'[INFO]' if result['success'] else '[ERROR]'} {result['message']}")
+    """执行单台 VPS 续期并发送既有结果通知。"""
+    services = RenewalServices(
+        prepare_initial_page=_prepare_initial_page,
+        check_initial_form=_check_initial_form,
+        ensure_warp_ready=ensure_warp_ready,
+        restart_warp=restart_warp,
+        handoff_to_warp=handoff_browser_to_warp,
+        prepare_warp_page=_prepare_warp_page,
+        prepare_final_form=_prepare_final_form,
+        refresh_code_page=_renew_refresh_code_page_after_captcha,
+        clean_page=removeAds,
+        capture=_capture_renewal_page,
+        read_vps_info=hax_get_vps_info,
+        warp_counters=get_warp_manager,
+    )
+    result = run_renewal(
+        browser, server_info, idx, phone_mask or mask_phone(phone), proxy,
+        services=services,
+        min_valid_days=MIN_VALID_DAYS,
+        max_renew_retries=MAX_RENEW_RETRIES_PER_URL,
+        max_warp_retries=MAX_WARP_RETRIES,
+    )
     notify(result, phone, tg_token=tg_token, tg_chat=tg_chat, ip_info=ip_info)
     return result
 

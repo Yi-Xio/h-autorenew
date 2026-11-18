@@ -17,9 +17,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import patch
 
-from scripts.job_summary import REASON_LABELS
-from scripts.public_report import WARP_FAILURE_REASONS
-from scripts.web_sessions import AuthenticationError
+from scripts.hax_renewal import flow, operations
+from tests.regression.fixtures import RenewalFeedbackFixture, renewal_browser
 
 PROJECT = Path(__file__).resolve().parents[2]
 CLI_SOURCE = r"""
@@ -75,14 +74,11 @@ class Clock:
 def warp_functions(clock: Clock) -> dict[str, Any]:
     """加载源文件实际类及业务函数，避免启动旧认证和浏览器依赖。"""
     names = {
-        "WarpError",
-        "CaptchaBlocked",
-        "ArithmeticCaptchaUnavailable",
         "WarpManager",
         "ensure_warp_ready",
         "restart_warp",
         "renew",
-        "_submit_code_page",
+        "_prepare_final_form",
     }
     source = ast.parse((PROJECT / "hax-renew.py").read_text())
     nodes: list[ast.stmt] = [
@@ -96,9 +92,10 @@ def warp_functions(clock: Clock) -> dict[str, Any]:
         time=clock,
         IPv4Address=IPv4Address,
         WARP_CMD_TIMEOUT=2,
-        WARP_FAILURE_REASONS=WARP_FAILURE_REASONS,
-        REASON_LABELS=REASON_LABELS,
-        AuthenticationError=AuthenticationError,
+        WarpError=flow.WarpError,
+        CaptchaBlocked=flow.CaptchaBlocked,
+        RenewalServices=flow.RenewalServices,
+        run_renewal=flow.run_renewal,
         MAX_WARP_ROTATE_ATTEMPTS=2,
         Dict=Dict,
         Any=Any,
@@ -236,41 +233,34 @@ class WarpTests(unittest.TestCase):
             self.assertFalse(self.manager.ensure_ready(max_attempts=1))
             self.assertEqual(self.manager.failure_reason, reason)
 
-    def business(self) -> tuple[dict[str, Any], list[str], object]:
+    def business(self) -> tuple[dict[str, Any], list[str], SimpleNamespace]:
         """业务函数保留实际网络判断，浏览器、消息服务和通知使用替身。"""
         namespace = self.namespace
         events: list[str] = []
-        browser = SimpleNamespace(
-            get_page_source=lambda: "<form></form>",
-            get_title=lambda: "Renew",
-            telegram_reader=SimpleNamespace(arm=lambda: None),
+        browser = renewal_browser(
+            SimpleNamespace(arm=lambda: None, wait_for_code=lambda **kwargs: "EXAMPLE_CODE"),
+            events,
         )
+        clock = SimpleNamespace(sleep=lambda seconds: None, time=lambda: 0)
+        self.enterContext(patch.object(flow, "time", clock))
+        self.enterContext(patch.object(operations, "time", clock))
+        self.enterContext(patch.object(operations, "RenewalFeedback", RenewalFeedbackFixture))
         namespace.update(
-            _parse_iso_date=lambda text: None,
-            cn_now=lambda: datetime.now(),
             mask_phone=lambda text: "example",
-            safe_sid_for_filename=lambda text: text,
             MAX_RENEW_RETRIES_PER_URL=0,
             MAX_WARP_RETRIES=1,
-            HAX_VPS_RENEW_CODE_URL="https://hax.co.id/vps-renew-code",
-            _renew_fill_form=lambda *args: None,
-            _renew_navigate_to_code_page=lambda *args: None,
+            MIN_VALID_DAYS=5,
+            _prepare_initial_page=lambda *args: None,
+            _check_initial_form=lambda *args: None,
             handoff_browser_to_warp=lambda *args: True,
-            dismiss_cookie_only=lambda *args: None,
+            _prepare_warp_page=lambda *args: None,
+            _prepare_final_form=lambda *args: True,
+            _renew_refresh_code_page_after_captcha=lambda *args: False,
             removeAds=lambda *args: None,
-            solve_arithmetic_captcha=lambda *args, **kwargs: None,
-            safe_screenshot=lambda *args: None,
-            shot=lambda *args: "example",
-            _renew_get_code=lambda *args: "EXAMPLE_BUSINESS_CODE",
-            _submit_code_page=lambda *args: events.append("submitted"),
+            _capture_renewal_page=lambda *args: None,
+            hax_get_vps_info=lambda *args: ([], "", None),
             notify=lambda *args, **kwargs: None,
         )
-
-        def feedback(page: object, result: dict[str, Any], old: str) -> bool:
-            result["success"] = True
-            return True
-
-        namespace["_renew_parse_result"] = feedback
         return namespace, events, browser
 
     def test_final_code_page_stops_when_required_ip_change_fails(self) -> None:
@@ -291,8 +281,8 @@ class WarpTests(unittest.TestCase):
             open=lambda url: events.append("opened"),
         )
         with self.assertRaises(self.namespace["WarpError"]) as error:
-            self.namespace["_submit_code_page"](
-                browser, "EXAMPLE_BUSINESS_CODE", 1, "example", max_retries=2
+            self.namespace["_prepare_final_form"](
+                browser, 1, "example", max_retries=2
             )
         self.assertEqual(error.exception.reason, "warp_new_exit_unavailable")
         self.assertEqual(events, [])
@@ -301,7 +291,7 @@ class WarpTests(unittest.TestCase):
         namespace, events, browser = self.business()
         result = namespace["renew"](browser, {"id": "example"}, 1, "+1-5550001234")
         self.assertTrue(result["success"], result.get("message"))
-        self.assertEqual(events, ["submitted"])
+        self.assertEqual(events.count("final_submit"), 1)
         self.assertEqual(result["warp_swaps"], 0)
         self.assertEqual(result["warp_refresh"], 0)
 
@@ -314,7 +304,7 @@ class WarpTests(unittest.TestCase):
             attempts.append("failed")
             raise namespace["CaptchaBlocked"]("example captcha failure")
 
-        namespace["_renew_fill_form"] = refused
+        namespace["_check_initial_form"] = refused
         result = namespace["renew"](browser, {"id": "example"}, 1, "+1-5550001234")
         self.assertFalse(result["success"])
         self.assertEqual(result["public_reason"], "warp_new_exit_unavailable")
@@ -324,8 +314,8 @@ class WarpTests(unittest.TestCase):
     def test_outer_retry_still_requires_a_different_exit(self) -> None:
         namespace, events, browser = self.business()
         namespace["MAX_RENEW_RETRIES_PER_URL"] = 2
-        namespace["_renew_parse_result"] = lambda *args: False
+        browser.page.feedback = dict(status="failed", date="", source="dialog", reason="code")
         result = namespace["renew"](browser, {"id": "example"}, 1, "+1-5550001234")
         self.assertFalse(result["success"])
         self.assertEqual(result["public_reason"], "warp_new_exit_unavailable")
-        self.assertEqual(events, ["submitted"])
+        self.assertEqual(events.count("final_submit"), 1)

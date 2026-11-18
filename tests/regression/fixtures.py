@@ -158,3 +158,58 @@ def navigation_sample(status: str = "ready") -> dict[str, object]:
         expected_route="renew_code",
         elapsed_seconds=0,
     )
+
+
+def renewal_browser(reader: object, events: list[str]) -> SimpleNamespace:
+    """模拟 Hax 表单及按钮，记录实际发起的页面操作。"""
+    browser = SimpleNamespace(
+        url="https://hax.co.id/",
+        telegram_reader=reader,
+        get_page_source=lambda: "<form></form>",
+        get_title=lambda: "Renew",
+        get_current_url=lambda: browser.url,
+    )
+
+    def open_page(url: str) -> None:
+        browser.url = url
+
+    def evaluate(script: str) -> object:
+        if "resp.innerHTML.length" in script:
+            return dict(href="https://hax.co.id/vps-renew-code", text="INPUT RENEW CODE")
+        if "link.click()" in script:
+            open_page("https://hax.co.id/vps-renew-code")
+            return True
+        if "btn.click()" in script:
+            events.append("form_submit")
+        return None
+
+    browser.open = open_page
+    browser.execute_script = evaluate
+    browser.page = SimpleNamespace(
+        ele=lambda locator, timeout: SimpleNamespace(
+            click=lambda: events.append("final_submit")
+        ),
+        handle_alert=lambda **kwargs: None,
+        events=events,
+        feedback=dict(status="success", date="2026-11-16", source="dialog", reason="none"),
+    )
+    return browser
+
+
+class RenewalFeedbackFixture:
+    """给本轮观察器提供示例页面反馈，以便核对点击前后的顺序。"""
+
+    def __init__(self, page: SimpleNamespace) -> None:
+        self.page = page
+        self.active = False
+
+    def activate(self) -> None:
+        self.active = True
+        self.page.events.append("observe")
+
+    def read(self) -> dict[str, str]:
+        self.page.events.append("feedback")
+        return self.page.feedback
+
+    def close(self) -> None:
+        self.active = False

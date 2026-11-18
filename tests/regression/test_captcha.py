@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
+from scripts.hax_renewal.flow import ArithmeticCaptchaUnavailable, CaptchaBlocked
 from scripts.public_report import publish_progress, record_check
 from tests.regression.fixtures import PROJECT
 
@@ -24,13 +25,11 @@ from tests.regression.fixtures import PROJECT
 def captcha_functions() -> dict[str, Any]:
     """加载实际求解器，浏览器和音频服务由外部接口替身提供。"""
     names = {
-        "CaptchaBlocked",
         "CaptchaAudioUnavailable",
-        "ArithmeticCaptchaUnavailable",
         "CaptchaSolver",
         "RecaptchaAudioSolver",
         "ArithmeticCaptchaSolver",
-        "_submit_code_page",
+        "_prepare_final_form",
     }
     source = ast.parse((PROJECT / "hax-renew.py").read_text())
     classes: list[ast.stmt] = [
@@ -39,6 +38,8 @@ def captcha_functions() -> dict[str, Any]:
         if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
     ]
     namespace: dict[str, Any] = dict(
+        CaptchaBlocked=CaptchaBlocked,
+        ArithmeticCaptchaUnavailable=ArithmeticCaptchaUnavailable,
         Dict=Dict,
         Any=Any,
         Optional=Optional,
@@ -246,7 +247,7 @@ class CaptchaTests(unittest.TestCase):
             self.assertEqual(self.elapsed, 5)
             self.assertNotIn("EXAMPLE_PRIVATE_FRAME", self.report.read_text())
 
-    def test_incomplete_or_unavailable_recaptcha_never_submits_business_code(
+    def test_incomplete_or_unavailable_recaptcha_stops_final_form_preparation(
         self,
     ) -> None:
         for dependency, failure, inspection in (
@@ -288,8 +289,8 @@ class CaptchaTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
                 self.assertRaises(self.namespace["CaptchaAudioUnavailable"]),
             ):
-                self.namespace["_submit_code_page"](
-                    browser, "EXAMPLE_BUSINESS_CODE", 1, "example", max_retries=1
+                self.namespace["_prepare_final_form"](
+                    browser, 1, "example", max_retries=1
                 )
             self.assertEqual(events, [])
             self.assertNotIn("EXAMPLE_PRIVATE", self.report.read_text())

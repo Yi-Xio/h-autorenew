@@ -3,16 +3,19 @@
 import ast
 import contextlib
 import io
-import re
 import unittest
-from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
+from unittest.mock import patch
 
+from scripts.hax_renewal import flow, operations
 from scripts.job_summary import REASON_LABELS
-from scripts.public_report import WARP_FAILURE_REASONS, record_check
 from scripts.web_auth import AuthenticationError
-from tests.regression.fixtures import PROJECT
+from tests.regression.fixtures import (
+    PROJECT,
+    RenewalFeedbackFixture,
+    renewal_browser,
+)
 
 
 def business_functions() -> dict[str, Any]:
@@ -21,11 +24,8 @@ def business_functions() -> dict[str, Any]:
     names = {
         "process",
         "renew",
-        "_renew_get_code",
         "handoff_browser_to_warp",
-        "_renew_parse_result",
         "hax_login_flow",
-        "WarpError",
     }
     functions: list[ast.stmt] = [
         node
@@ -38,8 +38,8 @@ def business_functions() -> dict[str, Any]:
         Optional=Optional,
         AuthenticationError=AuthenticationError,
         REASON_LABELS=REASON_LABELS,
-        record_check=record_check,
-        WARP_FAILURE_REASONS=WARP_FAILURE_REASONS,
+        run_renewal=flow.run_renewal,
+        RenewalServices=flow.RenewalServices,
     )
     exec(
         compile(ast.Module(body=functions, type_ignores=[]), "hax-renew.py", "exec"),
@@ -78,14 +78,6 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
         self.assertIs(browser.telegram_reader, reader)
 
     def test_current_site_captcha_rejection_has_explicit_diagnostic(self) -> None:
-        namespace = business_functions()
-        checks = []
-        namespace.update(
-            record_check=lambda *values: checks.append(values),
-            _drain_alerts=lambda browser: "",
-            _renew_capture_final_info=lambda *args: None,
-            time=SimpleNamespace(sleep=lambda seconds: None),
-        )
         tracker = SimpleNamespace(
             active=True,
             read=lambda: dict(
@@ -93,27 +85,27 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
             ),
             close=lambda: None,
         )
-        result = {}
-        with contextlib.redirect_stdout(io.StringIO()):
+        result: dict[str, Any] = {}
+        browser = SimpleNamespace(
+            renewal_submission=tracker,
+            page=SimpleNamespace(handle_alert=lambda **kwargs: None),
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            patch.object(flow, "record_check") as record,
+            patch.object(operations, "time"),
+        ):
             self.assertFalse(
-                namespace["_renew_parse_result"](
-                    SimpleNamespace(renewal_submission=tracker), result, "2026-11-21"
+                flow.collect_result(
+                    browser, result, "2026-11-21", lambda *_: ([], "", None)
                 )
             )
-        self.assertEqual(checks, [("captcha", "site_feedback", "rejected")])
+        record.assert_called_once_with("captcha", "site_feedback", "rejected")
         self.assertEqual(result["public_reason"], "captcha_failed")
 
     def test_current_success_feedback_is_valid_even_when_expiry_does_not_change(
         self,
     ) -> None:
-        namespace = business_functions()
-        namespace.update(
-            _drain_alerts=lambda browser: "",
-            _renew_capture_final_info=lambda browser, result, old: result.update(
-                info_valid_until=old
-            ),
-            time=SimpleNamespace(sleep=lambda seconds: None),
-        )
         tracker = SimpleNamespace(
             active=True,
             read=lambda: dict(
@@ -121,11 +113,21 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
             ),
             close=lambda: None,
         )
-        result = {}
-        browser = SimpleNamespace(renewal_submission=tracker)
-        with contextlib.redirect_stdout(io.StringIO()):
+        result: dict[str, Any] = {"server_id": "example"}
+        browser = SimpleNamespace(
+            renewal_submission=tracker,
+            page=SimpleNamespace(handle_alert=lambda **kwargs: None),
+        )
+
+        def read_vps_info(*_: object) -> tuple[list[dict[str, str]], str, None]:
+            return [dict(id="example", valid_until="2026-11-21")], "", None
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            patch.object(operations, "time"),
+        ):
             self.assertTrue(
-                namespace["_renew_parse_result"](browser, result, "2026-11-21")
+                flow.collect_result(browser, result, "2026-11-21", read_vps_info)
             )
         self.assertTrue(result["success"])
         self.assertEqual(result["feedback_status"], "success")
@@ -134,15 +136,11 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
     def test_expiry_or_unrelated_alert_does_not_override_failed_current_feedback(
         self,
     ) -> None:
+        def read_vps_info(*_: object) -> tuple[list[dict[str, str]], str, None]:
+            return [dict(id="example", valid_until="2026-12-01")], "", None
+
         for status, active in (("failed", True), ("unknown", True), ("unknown", False)):
-            namespace = business_functions()
-            namespace.update(
-                _drain_alerts=lambda browser: "Your VPS has been renewed until November 21, 2026",
-                _renew_capture_final_info=lambda browser, result, old: result.update(
-                    success=True, info_valid_until="2026-12-01", message="date_changed"
-                ),
-                time=SimpleNamespace(sleep=lambda seconds: None),
-            )
+            alerts = iter(["Your VPS has been renewed until November 21, 2026", None])
             tracker = SimpleNamespace(
                 active=active,
                 read=lambda: dict(
@@ -153,17 +151,21 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
                 ),
                 close=lambda: None,
             )
-            result = {}
-            with contextlib.redirect_stdout(io.StringIO()):
+            result: dict[str, Any] = {"server_id": "example"}
+            browser = SimpleNamespace(
+                renewal_submission=tracker,
+                page=SimpleNamespace(handle_alert=lambda **kwargs: next(alerts, None)),
+            )
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                patch.object(operations, "time"),
+            ):
                 self.assertFalse(
-                    namespace["_renew_parse_result"](
-                        SimpleNamespace(renewal_submission=tracker),
-                        result,
-                        "2026-11-21",
-                    )
+                    flow.collect_result(browser, result, "2026-11-21", read_vps_info)
                 )
             self.assertFalse(result["success"])
-            self.assertNotEqual(result["message"], "date_changed")
+            self.assertEqual(result["info_valid_until"], "2026-12-01")
+            self.assertEqual(result["feedback_status"], status)
 
     def test_handoff_restores_only_hax_cookies_before_first_navigation(self) -> None:
         """出口切换保留本站会话，不把域名相似的第三方 Cookie 带入。"""
@@ -292,53 +294,61 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
             self.assertEqual(result["servers"], [])
             self.assertEqual(notifications, [reason])
 
-    def renewal_environment(self, reader: object) -> tuple[dict[str, Any], list[str]]:
-        """提供原业务流程所需的外部接口，记录提交和出口切换。"""
+    def renewal_environment(
+        self,
+        events: list[str],
+        *,
+        retries: int = 0,
+    ) -> dict[str, Any]:
+        """通过账号入口运行实际单台 VPS 流程，替换外部服务。"""
         namespace = business_functions()
-        events = []
         manager = SimpleNamespace(
             current_tag="", rotation_count=0, warp_refresh_count=0
         )
-
-        def completed(browser: object, result: dict[str, Any], old: str) -> bool:
-            result.update(
-                success=True, info_valid_until="2026-12-01", message="verified"
-            )
-            return True
-
+        clock = SimpleNamespace(sleep=lambda seconds: None, time=lambda: 0)
+        self.enterContext(patch.object(operations, "time", clock))
+        self.enterContext(patch.object(flow, "time", clock))
+        self.enterContext(
+            patch.object(operations, "RenewalFeedback", RenewalFeedbackFixture)
+        )
         namespace.update(
-            _parse_iso_date=lambda value: datetime.strptime(value, "%Y-%m-%d").date()
-            if value
-            else None,
-            cn_now=lambda: datetime(2026, 11, 16),
             MIN_VALID_DAYS=5,
-            MAX_RENEW_RETRIES_PER_URL=5,
-            MAX_WARP_RETRIES=10,
-            CaptchaBlocked=RuntimeError,
-            ArithmeticCaptchaUnavailable=type(
-                "ArithmeticCaptchaUnavailable", (RuntimeError,), {}
-            ),
+            MAX_RENEW_RETRIES_PER_URL=retries,
+            MAX_WARP_RETRIES=1,
             get_warp_manager=lambda: manager,
             mask_phone=lambda value: "***123",
-            safe_sid_for_filename=lambda value: value,
-            re=re,
-            _renew_fill_form=lambda *args: events.append("form_submit"),
-            _renew_navigate_to_code_page=lambda *args: events.append("code_page"),
-            restart_warp=lambda *args: True,
+            _prepare_initial_page=lambda *args: None,
+            _check_initial_form=lambda *args: None,
+            restart_warp=lambda: True,
             ensure_warp_ready=lambda: None,
             handoff_browser_to_warp=lambda *args: events.append("handoff") or True,
-            dismiss_cookie_only=lambda *args: None,
+            _prepare_warp_page=lambda *args: None,
+            _prepare_final_form=lambda *args: True,
+            _renew_refresh_code_page_after_captcha=lambda *args: False,
             removeAds=lambda *args: None,
-            solve_arithmetic_captcha=lambda *args, **kwargs: None,
-            safe_screenshot=lambda *args: None,
-            shot=lambda *args: "",
-            _submit_code_page=lambda *args: events.append("final_submit"),
-            _renew_parse_result=completed,
+            _capture_renewal_page=lambda *args: None,
+            hax_get_vps_info=lambda *args: (
+                [dict(id="example", valid_until="2026-11-16")],
+                "",
+                None,
+            ),
             notify=lambda *args, **kwargs: events.append("notify"),
-            time=SimpleNamespace(sleep=lambda seconds: None),
-            HAX_VPS_RENEW_CODE_URL="https://hax.co.id/vps-renew-code/",
         )
-        return namespace, events
+        return namespace
+
+    def run_example_renewal(
+        self,
+        namespace: dict[str, Any],
+        browser: object,
+        valid_until: str,
+    ) -> dict[str, Any]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return namespace["renew"](
+                browser,
+                dict(id="example", valid_until=valid_until, current_date="2026-11-16"),
+                1,
+                "+1-5550001234",
+            )
 
     def test_business_flow_arms_reader_before_trigger_and_survives_handoff(
         self,
@@ -353,55 +363,87 @@ class HaxAuthenticationFlowTests(unittest.TestCase):
                 events.append("read_code")
                 return "EXAMPLE_CODE_1234567890"
 
-        reader = Reader()
-        namespace, tracked = self.renewal_environment(reader)
-        namespace["_renew_fill_form"] = lambda *args: events.append("form_submit")
-        namespace["handoff_browser_to_warp"] = (
-            lambda *args: events.append("handoff") or True
+        namespace = self.renewal_environment(events)
+        result = self.run_example_renewal(
+            namespace,
+            renewal_browser(Reader(), events),
+            "2026-11-16",
         )
-        namespace["_submit_code_page"] = lambda *args: events.append("final_submit")
-        browser = SimpleNamespace(
-            telegram_reader=reader,
-            get_page_source=lambda: "ready",
-            get_title=lambda: "ready",
-        )
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = namespace["renew"](
-                browser,
-                dict(id="example", valid_until="2026-11-16"),
-                1,
-                "+1-5550001234",
-            )
         self.assertTrue(result["success"])
         self.assertEqual(
-            events, ["arm", "form_submit", "handoff", "read_code", "final_submit"]
+            events,
+            [
+                "arm",
+                "form_submit",
+                "handoff",
+                "read_code",
+                "observe",
+                "final_submit",
+                "feedback",
+                "notify",
+            ],
         )
-        self.assertEqual(tracked[-1], "notify")
 
     def test_ambiguous_code_stops_without_final_submit_or_automatic_retry(self) -> None:
-        reader = SimpleNamespace(arm=lambda: None)
-
         def ambiguous(timeout: float) -> None:
             raise AuthenticationError("renewal_code_ambiguous")
 
-        reader.wait_for_code = ambiguous
-        namespace, events = self.renewal_environment(reader)
-        browser = SimpleNamespace(
-            telegram_reader=reader,
-            get_page_source=lambda: "ready",
-            get_title=lambda: "ready",
+        events: list[str] = []
+        browser = renewal_browser(
+            SimpleNamespace(arm=lambda: None, wait_for_code=ambiguous),
+            events,
         )
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = namespace["renew"](
-                browser,
-                dict(id="example", valid_until="2026-11-16"),
-                1,
-                "+1-5550001234",
-            )
+        namespace = self.renewal_environment(events, retries=5)
+        result = self.run_example_renewal(namespace, browser, "2026-11-16")
         self.assertFalse(result["success"])
         self.assertEqual(result["public_reason"], "renewal_code_ambiguous")
         self.assertEqual(events.count("form_submit"), 1)
         self.assertNotIn("final_submit", events)
+
+    def test_valid_period_skips_requests_and_reports_result(self) -> None:
+        events: list[str] = []
+        namespace = self.renewal_environment(events)
+        result = self.run_example_renewal(namespace, object(), "2026-11-21")
+        self.assertTrue(result["skipped"])
+        self.assertEqual(events, ["notify"])
+
+    def test_final_form_preparation_failure_does_not_click(self) -> None:
+        def unavailable(*args: object) -> bool:
+            raise flow.CaptchaBlocked("Example site verification failure")
+
+        events: list[str] = []
+        browser = renewal_browser(
+            SimpleNamespace(
+                arm=lambda: None, wait_for_code=lambda **kwargs: "EXAMPLE_CODE"
+            ),
+            events,
+        )
+        namespace = self.renewal_environment(events)
+        namespace["_prepare_final_form"] = unavailable
+        result = self.run_example_renewal(namespace, browser, "2026-11-16")
+        self.assertFalse(result["success"])
+        self.assertFalse(result["submission_attempted"])
+        self.assertEqual(result["public_reason"], "captcha_failed")
+        self.assertEqual(events, ["form_submit", "handoff", "notify"])
+
+    def test_missing_feedback_after_final_click_is_unverified(self) -> None:
+        events: list[str] = []
+        browser = renewal_browser(
+            SimpleNamespace(
+                arm=lambda: None, wait_for_code=lambda **kwargs: "EXAMPLE_CODE"
+            ),
+            events,
+        )
+        browser.page.feedback = dict(
+            status="unknown", date="", source="none", reason="none"
+        )
+        namespace = self.renewal_environment(events)
+        result = self.run_example_renewal(namespace, browser, "2026-11-16")
+        self.assertFalse(result["success"])
+        self.assertTrue(result["submission_attempted"])
+        self.assertEqual(result["public_reason"], "renewal_unverified")
+        self.assertEqual(events.count("final_submit"), 1)
+        self.assertEqual(events.count("feedback"), 6)
 
     def test_old_authorization_and_logout_functions_are_removed(self) -> None:
         tree = ast.parse((PROJECT / "hax-renew.py").read_text())
